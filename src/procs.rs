@@ -173,7 +173,16 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
-        let proc = info(child.id()).unwrap();
+        // Right after spawn the child may not have exec'd yet, in which case it
+        // still carries the forked test thread's name. Wait for the exec.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let proc = loop {
+            let proc = info(child.id()).unwrap();
+            if proc.name == "sleep" || std::time::Instant::now() > deadline {
+                break proc;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert_eq!(proc.ppid, std::process::id());
         assert_eq!(proc.name, "sleep");
         child.kill().unwrap();
