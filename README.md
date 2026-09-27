@@ -8,7 +8,7 @@ When several agents (Claude Code and OpenAI Codex CLI) work on the same project 
 - **a shared memory**: notes, decisions, gotchas and handoffs that every agent can search, next to your repo's own Markdown docs. Each note records who wrote it and every revision, and an update can't silently overwrite another agent's change;
 - **coordination**: claims on files, directories and tasks, plus a heads-up when an agent edits something another agent has claimed.
 
-It's one small Rust binary (about 2.5 MB) and one local SQLite database at `~/.chitchat/chitchat.db`. Nothing runs in the background: each agent launches `chitchat mcp` over stdio, and client hooks call `chitchat hook` to deliver messages when you prompt an agent.
+It's one small Rust binary and one local SQLite database at `~/.chitchat/chitchat.db`. There is no daemon: each agent launches `chitchat mcp` over stdio, and client hooks call `chitchat hook` to deliver messages when you prompt an agent. Release builds also start a short-lived background updater at most once a day.
 
 ## Install
 
@@ -21,6 +21,20 @@ curl -fsSL https://raw.githubusercontent.com/cyoab/chitchat/main/install.sh | sh
 - **What it does:** downloads the latest release, verifies its SHA-256 checksum, and installs `chitchat` to `~/.local/bin`.
 - **Options:** `CHITCHAT_VERSION=v0.1.0` pins a version; `CHITCHAT_INSTALL_DIR=...` installs somewhere else.
 - **From source:** `cargo install --git https://github.com/cyoab/chitchat`.
+
+## Updates
+
+```sh
+chitchat update                   # install the latest GitHub release
+chitchat update --check           # report availability without replacing the binary
+chitchat update --version v0.2.0  # install a specific release (including an older one)
+```
+
+Starting an MCP server from a release build checks for and installs updates in a detached process, at most once every 24 hours. Set `CHITCHAT_AUTO_UPDATE=0` to disable this. Debug builds and hooks do not start updates. Running sessions continue with their current binary until restarted.
+
+Updates require `curl`, `tar`, and `sha256sum` or `shasum`. The updater downloads the platform archive and checksum from GitHub, verifies SHA-256 and the binary's version, then replaces the executable with an atomic rename. Its directory must be writable. Failed checks are recorded and retried on the next daily check; `chitchat update` retries immediately. Check time and outcome are stored in `CHITCHAT_HOME/update.json`.
+
+Version 0.1.0 has no updater: run the installer once to get a version with this command. To stay on a pinned release, disable automatic updates as well.
 
 ## Set up a project
 
@@ -101,6 +115,28 @@ chitchat forget <key>               # soft-delete a note
 chitchat workspaces                 # every workspace on this machine
 ```
 
+## Import existing memories
+
+Run inside a workspace:
+
+```sh
+chitchat import --dry-run           # list candidate notes and scopes; write nothing
+chitchat import                     # import all supported sources
+chitchat import --from codex        # claude, codex, gemini, or all
+```
+
+| Source | Files | Scope |
+|---|---|---|
+| Claude Code | `CLAUDE_CONFIG_DIR/projects/<encoded workspace path>/memory/*.md` (default `~/.claude`), excluding the `MEMORY.md` index | Project, including linked worktrees |
+| Codex | Markdown under `CODEX_HOME/memories/` (default `~/.codex`), including `MEMORY.md`, `memory_summary.md`, and rollout summaries; excludes raw consolidation inputs and skills | Global for consolidated files; rollout files with `cwd:` metadata are imported only for the matching workspace, as project notes |
+| Gemini CLI | The `## Gemini Added Memories` section of `~/.gemini/GEMINI.md` (`GEMINI_CLI_HOME` overrides the home directory) | Global |
+
+Notes use `imported/<source>/...` keys with source tags and provenance. Source files stay untouched. Re-importing unchanged content preserves revisions; changes update the same notes. Large Codex and Gemini files are split into bounded parts, and obsolete trailing parts are soft-deleted when the file shrinks. Removing a source file does not delete its imported notes. Missing sources are skipped.
+
+Imports are source-authoritative: edits to imported notes may be replaced on re-import. Consolidated Codex files can contain context about several projects, so review the dry-run scope before importing. The command reads the Markdown memory store, not private Codex databases or session transcripts. `init` continues importing only Claude memories as before.
+
+Source formats: [Codex local memories](https://learn.chatgpt.com/docs/customization/memories), [Gemini memory files](https://geminicli.com/docs/tools/memory/).
+
 ## Backups
 
 ```sh
@@ -120,6 +156,7 @@ chitchat restore latest         # or: chitchat restore <file>
 | `CHITCHAT_HOME` | `~/.chitchat` | Where the database and backups live |
 | `CHITCHAT_LOG` | `warn` | Log level (written to stderr) |
 | `CHITCHAT_AUTO_BACKUP` | on | `0` disables daily automatic backups |
+| `CHITCHAT_AUTO_UPDATE` | on (release builds) | `0` disables daily automatic updates |
 | `CHITCHAT_PROJECT` | from `.chitchat/workspace.json` | Force a project key (testing, unusual setups) |
 
 ## Releasing

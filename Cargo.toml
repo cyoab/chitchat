@@ -16,6 +16,7 @@ dirs = "7.0.0"
 rmcp = { version = "3.4.1", default-features = false, features = ["server", "macros", "schemars", "transport-io"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 schemars = "1.2.2"
+semver = "1.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 tokio = { version = "1.53.1", features = ["rt", "macros", "io-std"] }

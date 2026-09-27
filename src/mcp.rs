@@ -700,6 +700,8 @@ pub fn run(client: Option<Client>) -> Result<()> {
         Err(e) => tracing::warn!("daily backup failed: {e:#}"),
     }
 
+    crate::update::spawn_auto_check();
+
     let server = ChitchatServer::new(db, ws, vendor, client_proc, session);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -40,6 +40,8 @@ impl Env {
             .env("CHITCHAT_HOME", self.home.path().join("data"))
             .env("CLAUDE_CONFIG_DIR", self.home.path().join("claude-config"))
             .env("CODEX_HOME", self.home.path().join("codex-home"))
+            .env("GEMINI_CLI_HOME", self.home.path().join("gemini-home"))
+            .env("CHITCHAT_AUTO_UPDATE", "0")
             .env_remove("CHITCHAT_PROJECT")
             .env_remove("CHITCHAT_CLIENT_PID")
             .env_remove("CLAUDECODE")
@@ -608,4 +610,122 @@ fn backups_restore_earlier_state() {
         .unwrap();
     env.cli(&["restore", pre.to_str().unwrap()]);
     assert!(env.cli(&["tail", "--no-follow"]).contains("second"));
+}
+
+#[test]
+fn imports_harness_memory_with_dry_run_scopes_and_idempotent_revisions() {
+    let env = Env::new();
+    let codex = env.home.path().join("codex-home/memories");
+    std::fs::create_dir_all(codex.join("rollout_summaries")).unwrap();
+    std::fs::create_dir_all(codex.join("skills/example")).unwrap();
+    std::fs::write(
+        codex.join("MEMORY.md"),
+        "# Durable conventions\nPrefer explicit errors.",
+    )
+    .unwrap();
+    std::fs::write(codex.join("raw_memories.md"), "Raw duplicate evidence").unwrap();
+    std::fs::write(codex.join("skills/example/SKILL.md"), "Not a memory note").unwrap();
+    std::fs::write(
+        codex.join("rollout_summaries/local.md"),
+        format!("cwd: {}\n\nProject-specific lesson", env.repo.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        codex.join("rollout_summaries/other.md"),
+        "cwd: /unrelated/project\nNot this workspace",
+    )
+    .unwrap();
+    let gemini = env.home.path().join("gemini-home/.gemini");
+    std::fs::create_dir_all(&gemini).unwrap();
+    std::fs::write(gemini.join("GEMINI.md"), "# General instructions\nDo not import this.\n## Gemini Added Memories\n- Use the staging environment.\n### Details\nRemember the fixture.\n## Other instructions\nDo not import these either.\n").unwrap();
+
+    let preview = env.cli(&["import", "--dry-run"]);
+    assert!(preview.contains("Dry run: 3 notes"), "{preview}");
+    assert!(
+        !env.home.path().join("data").exists(),
+        "dry run must not create or open a database"
+    );
+    let first = env.cli(&["import", "--from", "all"]);
+    assert!(first.contains("3 new, 0 updated, 0 unchanged"), "{first}");
+    let second = env.cli(&["import"]);
+    assert!(second.contains("0 new, 0 updated, 3 unchanged"), "{second}");
+    let conn = chitchat::db::open(&env.home.path().join("data/chitchat.db")).unwrap();
+    let scopes: (i64, i64) = conn.query_row("SELECT sum(project_id IS NULL), sum(project_id IS NOT NULL) FROM notes WHERE deleted_at IS NULL", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(scopes, (2, 1));
+    let gemini_body: String = conn
+        .query_row(
+            "SELECT body FROM notes WHERE key LIKE 'imported/gemini/%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(gemini_body.contains("staging environment"));
+    assert!(gemini_body.contains("Remember the fixture"));
+    assert!(!gemini_body.contains("Do not import"));
+    std::fs::write(
+        codex.join("MEMORY.md"),
+        "# Durable conventions\nUse typed errors.",
+    )
+    .unwrap();
+    assert!(
+        env.cli(&["import", "--from", "codex"])
+            .contains("0 new, 1 updated, 1 unchanged")
+    );
+    let revision: i64 = conn
+        .query_row("SELECT max(revision) FROM notes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(revision, 2);
+}
+
+#[test]
+fn large_memory_is_split_and_obsolete_parts_are_retired_on_reimport() {
+    let env = Env::new();
+    let codex = env.home.path().join("codex-home/memories");
+    std::fs::create_dir_all(&codex).unwrap();
+    let file = codex.join("MEMORY.md");
+    let long = format!("# Unicode memory\n{}", "記憶".repeat(20_000));
+    std::fs::write(&file, &long).unwrap();
+    assert!(env.cli(&["import", "--from", "codex"]).contains("3 new"));
+    let conn = chitchat::db::open(&env.home.path().join("data/chitchat.db")).unwrap();
+    let mut stmt = conn.prepare("SELECT body FROM notes ORDER BY key").unwrap();
+    let parts: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        parts
+            .iter()
+            .all(|p| p.chars().count() <= chitchat::memory::MAX_BODY_CHARS)
+    );
+    let recovered: String = parts
+        .iter()
+        .map(|p| {
+            p.split_once("\n\n")
+                .unwrap()
+                .1
+                .split("\n\n_Imported from")
+                .next()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(recovered, long);
+    drop(stmt);
+    std::fs::write(&file, "A shorter replacement.").unwrap();
+    assert!(
+        env.cli(&["import", "--from", "codex"])
+            .contains("1 updated")
+    );
+    let live: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM notes WHERE deleted_at IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 1);
+    assert!(
+        env.cli(&["import", "--from", "codex"])
+            .contains("1 unchanged")
+    );
 }

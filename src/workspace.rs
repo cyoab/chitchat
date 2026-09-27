@@ -15,14 +15,14 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::agents::{self, Agent};
+use crate::agents;
 use crate::clients;
 use crate::db::now_ms;
 use crate::format;
-use crate::memory::{self, NoteInput, Saved, Scope};
+use crate::memory;
 use crate::project::{self, Marker, canonical};
 use crate::session::Client;
 
@@ -125,7 +125,7 @@ pub fn init(path: Option<&Path>, opts: &InitOptions) -> Result<()> {
     println!("Docs: {total_docs} Markdown files indexed ({docs} changed)");
 
     if opts.import {
-        let counts = import_claude_memory(&mut conn, project_id, &user, &targets)?;
+        let counts = crate::import::import_claude_memory(&mut conn, project_id, &user, &targets)?;
         if counts.seen > 0 {
             println!(
                 "Imported Claude Code memory: {} new, {} updated, {} unchanged",
@@ -238,134 +238,7 @@ fn register(conn: &Connection, marker: &Marker, dir: &Path) -> Result<(i64, Opti
     Ok((conn.last_insert_rowid(), None))
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct ImportCounts {
-    pub seen: usize,
-    pub created: usize,
-    pub updated: usize,
-    pub unchanged: usize,
-}
-
-/// `~/.claude/projects` (or under `CLAUDE_CONFIG_DIR`).
-fn claude_projects_dir() -> Option<PathBuf> {
-    match std::env::var_os("CLAUDE_CONFIG_DIR") {
-        Some(dir) => Some(PathBuf::from(dir).join("projects")),
-        None => dirs::home_dir().map(|h| h.join(".claude").join("projects")),
-    }
-}
-
-/// Claude Code names a project's data directory after its path, with every
-/// character that isn't an ASCII letter or digit replaced by '-'.
-pub fn claude_project_dir_name(path: &Path) -> String {
-    path.to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
-}
-
-/// Imports Claude Code's memory files for `dirs` as shared project notes under
-/// `imported/claude/<name>`. The file is the source of truth for these notes, so
-/// changed files update them in place.
-pub fn import_claude_memory(
-    conn: &mut Connection,
-    project_id: i64,
-    author: &Agent,
-    dirs: &[PathBuf],
-) -> Result<ImportCounts> {
-    let mut counts = ImportCounts::default();
-    let Some(projects) = claude_projects_dir() else {
-        return Ok(counts);
-    };
-    for dir in dirs {
-        let memory_dir = projects.join(claude_project_dir_name(dir)).join("memory");
-        let Ok(entries) = std::fs::read_dir(&memory_dir) else {
-            continue;
-        };
-        let mut files: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "md"))
-            .filter(|p| p.file_name().is_some_and(|n| n != "MEMORY.md"))
-            .collect();
-        files.sort();
-        for file in files {
-            let text = std::fs::read_to_string(&file)
-                .with_context(|| format!("reading {}", file.display()))?;
-            let Some(input) = claude_memory_note(&file, &text) else {
-                continue;
-            };
-            counts.seen += 1;
-            match memory::remember(conn, project_id, author, input)? {
-                Saved::Created(_) => counts.created += 1,
-                Saved::Updated(_) => counts.updated += 1,
-                Saved::Unchanged(_) => counts.unchanged += 1,
-            }
-        }
-    }
-    Ok(counts)
-}
-
-/// One Claude Code memory file (frontmatter with name / description /
-/// metadata.type, then Markdown) as a note.
-fn claude_memory_note(file: &Path, text: &str) -> Option<NoteInput> {
-    let stem = file.file_stem()?.to_string_lossy().into_owned();
-    let (front, body) = split_frontmatter(text);
-    let field = |k: &str| {
-        front.lines().find_map(|l| {
-            let (key, value) = l.trim().split_once(':')?;
-            (key.trim() == k).then(|| value.trim().trim_matches(['"', '\'']).to_string())
-        })
-    };
-    let name = field("name").filter(|n| !n.is_empty()).unwrap_or(stem);
-    let kind = match field("type").as_deref() {
-        Some("feedback") => "gotcha",
-        Some("project") | Some("reference") => "fact",
-        _ => "note",
-    };
-    let body = body.trim();
-    if body.is_empty() {
-        return None;
-    }
-    let title = field("description")
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(|| name.clone());
-    let source = file.file_name()?.to_string_lossy().into_owned();
-    let mut body = format::truncate(body, memory::MAX_BODY_CHARS - 200);
-    body.push_str(&format!(
-        "\n\n_Imported from Claude Code memory (`{source}`)._"
-    ));
-    let mut tags = vec!["imported".to_string(), "claude-memory".to_string()];
-    if let Some(t) = field("type").filter(|t| t.chars().all(|c| c.is_ascii_lowercase())) {
-        tags.push(t);
-    }
-    Some(NoteInput {
-        key: Some(format!("imported/claude/{}", memory::slug(&name))),
-        kind: Some(kind.to_string()),
-        title: format::truncate(title.lines().next().unwrap_or_default(), 200),
-        body,
-        tags,
-        scope: Scope::Project,
-        expected_revision: None,
-        supersedes: None,
-        overwrite: true,
-    })
-}
-
-fn split_frontmatter(text: &str) -> (&str, &str) {
-    let Some(rest) = text
-        .strip_prefix("---\n")
-        .or_else(|| text.strip_prefix("---\r\n"))
-    else {
-        return ("", text);
-    };
-    match rest.find("\n---") {
-        Some(end) => {
-            let after = &rest[end + 4..];
-            (&rest[..end], after.split_once('\n').map_or("", |(_, b)| b))
-        }
-        None => ("", text),
-    }
-}
+pub use crate::import::claude_project_dir_name;
 
 /// Turns chitchat off for the workspace containing `path` (and its worktrees),
 /// keeping its data.
@@ -456,18 +329,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn claude_dir_names_match_claude_codes_encoding() {
-        assert_eq!(
-            claude_project_dir_name(Path::new("/Users/yoab/Desktop/Projects/chitchat")),
-            "-Users-yoab-Desktop-Projects-chitchat"
-        );
-        assert_eq!(
-            claude_project_dir_name(Path::new("/tmp/claude-501/-Users-x/my.repo")),
-            "-tmp-claude-501--Users-x-my-repo"
-        );
-    }
-
-    #[test]
     fn register_adopts_data_recorded_before_workspaces() {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("t.db")).unwrap();
@@ -490,25 +351,5 @@ mod tests {
         assert_eq!(key, marker.key());
         // Registering again finds the adopted row.
         assert_eq!(register(&conn, &marker, &ws_dir).unwrap(), (old_id, None));
-    }
-
-    #[test]
-    fn memory_files_become_notes() {
-        let text = "---\nname: no-claude-coauthor\ndescription: Never add a Claude co-author trailer\nmetadata:\n  type: feedback\n---\n\nDon't add the trailer.\n";
-        let note = claude_memory_note(Path::new("/m/no-claude-coauthor.md"), text).unwrap();
-        assert_eq!(
-            note.key.as_deref(),
-            Some("imported/claude/no-claude-coauthor")
-        );
-        assert_eq!(note.kind.as_deref(), Some("gotcha"));
-        assert_eq!(note.title, "Never add a Claude co-author trailer");
-        assert!(note.body.starts_with("Don't add the trailer."));
-        assert_eq!(note.tags, ["imported", "claude-memory", "feedback"]);
-        assert!(note.overwrite);
-
-        let plain = claude_memory_note(Path::new("/m/Plain Note.md"), "just text").unwrap();
-        assert_eq!(plain.key.as_deref(), Some("imported/claude/plain-note"));
-        assert_eq!(plain.kind.as_deref(), Some("note"));
-        assert!(claude_memory_note(Path::new("/m/empty.md"), "---\nname: x\n---\n").is_none());
     }
 }

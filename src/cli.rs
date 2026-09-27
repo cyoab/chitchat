@@ -15,6 +15,26 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Install a release from GitHub, or check whether an update is available.
+    Update {
+        /// Report availability without installing anything.
+        #[arg(long, conflicts_with = "auto")]
+        check: bool,
+        /// Install a specific release (for example v0.2.0).
+        #[arg(long, conflicts_with = "auto")]
+        version: Option<String>,
+        #[arg(long, hide = true)]
+        auto: bool,
+    },
+    /// Copy harness memories into shared notes (source files are never changed).
+    Import {
+        /// Source: claude, codex, gemini, or all.
+        #[arg(long, default_value = "all", value_parser = crate::import::parse_source)]
+        from: crate::import::Selection,
+        /// List candidate notes without opening or changing the database.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run the MCP server over stdio (what each agent's MCP config launches).
     Mcp {
         /// The client launching this server. Detected automatically for Claude Code.

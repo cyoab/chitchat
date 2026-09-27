@@ -20,6 +20,12 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Update {
+            check,
+            version,
+            auto,
+        } => chitchat::update::run(check, version.as_deref(), auto),
+        Command::Import { from, dry_run } => chitchat::import::run(from.0, dry_run),
         Command::Mcp { client } => chitchat::mcp::run(client),
         Command::Hook { event, client } => {
             chitchat::hook::run(event, client);

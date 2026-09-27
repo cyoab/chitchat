@@ -118,6 +118,7 @@ dependencies = [
  "rmcp",
  "rusqlite",
  "schemars",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",
@@ -747,6 +748,12 @@ dependencies = [
  "serde_derive_internals",
  "syn 3.0.6",
 ]
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"
