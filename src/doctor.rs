@@ -19,6 +19,9 @@ pub fn run() -> Result<()> {
 
     println!("chitchat  {}", env!("CARGO_PKG_VERSION"));
     println!("binary    {}", clients::binary_path()?.display());
+    if let Some(update) = crate::update::status() {
+        println!("updates   {update}");
+    }
     println!("database  {}", db_path.display());
     println!("sqlite    {sqlite} (journal: {journal})");
     println!(

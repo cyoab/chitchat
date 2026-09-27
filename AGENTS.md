@@ -21,6 +21,10 @@ chitchat is a Rust CLI and stdio MCP server. It gives Claude Code and Codex sess
 | `src/workspace.rs` | `chitchat init/deinit/workspaces`: workspace setup, legacy adoption, Claude memory import |
 | `src/clients.rs` | Per-directory client config (Claude local MCP + settings.local.json, Codex .codex/), git exclude |
 | `src/backup.rs` | `chitchat backup/restore`, daily automatic backups |
+| `src/update.rs` | `chitchat update`, daily detached auto-update from GitHub releases |
+| `src/import.rs` | `chitchat import`: Claude/Codex/Gemini memories → shared notes |
+| `src/harness.rs` | The table of supported agent harnesses (MCP, hooks, output, skills) |
+| `skills/chitchat/SKILL.md` | The skill `init` installs for every harness |
 | `src/human.rs` | Commands for the human: `post`, `tail`, `who`, `notes`, `note`, `forget`, `export` |
 | `src/agents.rs` | Participants: identity resolution (Claude by process, Codex by session), presence |
 | `src/chat.rs` | Messages, receipts (fan-out on write), inbox, acks, hook delivery |
@@ -46,8 +50,10 @@ chitchat is a Rust CLI and stdio MCP server. It gives Claude Code and Codex sess
   - Keep transactions short.
   - Use `TransactionBehavior::Immediate` for any read-then-write.
   - Always open connections through `db::open`.
-- **Migrations are append-only.**
+- **Migrations are append-only and must stay compatible with running older binaries.**
   - Never edit a released file in `migrations/`. Add a new file and append it to `MIGRATIONS` in `src/db.rs`.
+  - After an auto-update, hooks run the new binary while already-running MCP servers keep the old one. So a migration may add tables/columns or loosen constraints, but must not drop or rename anything an older release still queries.
+  - The migrator runs with foreign keys off (needed to rebuild a table) and checks them before committing.
   - Tables are `STRICT`, and timestamps are unix milliseconds.
 - **Never touch the user's real client config in tests.** Point `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `CHITCHAT_HOME` at temp dirs, as `tests/cli.rs` does.
 - **Keep MCP tool results small** (under about 8k tokens) and paginate. Codex truncates at about 10k tokens.
