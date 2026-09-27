@@ -1,0 +1,13 @@
+# Rust build output
+/target/
+
+# Local chitchat data (if ever created inside the repo)
+/.chitchat/*.db
+/.chitchat/*.db-wal
+/.chitchat/*.db-shm
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
