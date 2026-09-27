@@ -7,6 +7,19 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// The release the fake GitHub serves: one minor version ahead of this build, so
+/// these tests keep working across version bumps.
+fn next_version() -> String {
+    let v = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+    format!("{}.{}.0", v.major, v.minor + 1)
+}
+
+/// A version that is neither this build nor the served release.
+fn later_version() -> String {
+    let v = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+    format!("{}.{}.0", v.major, v.minor + 2)
+}
+
 struct Fixture {
     temp: tempfile::TempDir,
     binary: PathBuf,
@@ -38,7 +51,7 @@ impl Fixture {
         fs::create_dir(&fake_bin).unwrap();
         script(
             &fake_bin.join("curl"),
-            r##"#!/bin/sh
+            &r##"#!/bin/sh
 set -eu
 printf 'call\n' >> "$UPDATE_FIXTURE/calls"
 dest=
@@ -51,12 +64,13 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 case "$last" in
-  */latest) if [ "${UPDATE_DELAY:-0}" = 1 ]; then sleep 2; fi; printf 'https://github.com/cyoab/chitchat/releases/tag/v0.2.0' ;;
+  */latest) if [ "${UPDATE_DELAY:-0}" = 1 ]; then sleep 2; fi; printf 'https://github.com/cyoab/chitchat/releases/tag/v__NEXT__' ;;
   *.sha256) cp "$UPDATE_FIXTURE/$UPDATE_ASSET.sha256" "$dest" ;;
   *.tar.gz) cp "$UPDATE_FIXTURE/$UPDATE_ASSET" "$dest" ;;
   *) exit 22 ;;
 esac
-"##,
+"##
+            .replace("__NEXT__", &next_version()),
         );
         let fixture = Self {
             temp,
@@ -64,7 +78,7 @@ esac
             archive,
             asset,
         };
-        fixture.package("0.2.0", false);
+        fixture.package(&next_version(), false);
         fixture
     }
 
@@ -189,7 +203,7 @@ fn release_mcp_starts_promptly_and_updater_outlives_it_without_protocol_output()
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let state = fs::read(f.temp.path().join("data/update.json")).unwrap_or_default();
-        if String::from_utf8_lossy(&state).contains("installed 0.2.0") {
+        if String::from_utf8_lossy(&state).contains(&format!("installed {}", next_version())) {
             break;
         }
         assert!(
@@ -216,9 +230,11 @@ fn check_then_install_uses_verified_release_without_stdout() {
         String::from_utf8_lossy(&check.stderr)
     );
     assert!(check.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&check.stderr).contains("available 0.2.0"));
+    assert!(
+        String::from_utf8_lossy(&check.stderr).contains(&format!("available {}", next_version()))
+    );
     f.unchanged(&before);
-    let installed = f.run(&["--version", "v0.2.0"]);
+    let installed = f.run(&["--version", &format!("v{}", next_version())]);
     assert!(
         installed.status.success(),
         "{}",
@@ -235,7 +251,7 @@ fn check_then_install_uses_verified_release_without_stdout() {
         state["outcome"]
             .as_str()
             .unwrap()
-            .contains("installed 0.2.0")
+            .contains(&format!("installed {}", next_version()))
     );
 }
 
@@ -250,11 +266,11 @@ fn bad_checksum_archive_or_version_never_replaces_installed_binary() {
                 format!("{}  {}\n", "0".repeat(64), f.asset),
             )
             .unwrap(),
-            "archive" => f.package("0.2.0", true),
-            "version" => f.package("0.3.0", false),
+            "archive" => f.package(&next_version(), true),
+            "version" => f.package(&later_version(), false),
             _ => unreachable!(),
         }
-        let out = f.run(&["--version", "v0.2.0"]);
+        let out = f.run(&["--version", &format!("v{}", next_version())]);
         assert!(!out.status.success(), "{failure}");
         assert!(out.stdout.is_empty());
         f.unchanged(&before);

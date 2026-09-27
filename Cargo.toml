@@ -1,6 +1,6 @@
 [package]
 name = "chitchat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Shared memory and a project group chat for Claude Code and Codex agents, over MCP"

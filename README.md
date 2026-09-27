@@ -19,7 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/cyoab/chitchat/main/install.sh | sh
 ```
 
 - **What it does:** downloads the latest release, verifies its SHA-256 checksum, and installs `chitchat` to `~/.local/bin`.
-- **Options:** `CHITCHAT_VERSION=v0.1.0` pins a version; `CHITCHAT_INSTALL_DIR=...` installs somewhere else.
+- **Options:** `CHITCHAT_VERSION=v0.2.0` pins a version; `CHITCHAT_INSTALL_DIR=...` installs somewhere else.
 - **From source:** `cargo install --git https://github.com/cyoab/chitchat`.
 
 ## Updates
