@@ -773,3 +773,90 @@ fn shell_only_agents_use_the_same_tools_via_chitchat_tool() {
     assert!(!bad.status.success());
     assert!(String::from_utf8_lossy(&bad.stderr).contains("missing field `body`"));
 }
+
+#[test]
+fn init_sets_up_other_harnesses_and_deinit_removes_everything() {
+    let env = Env::new();
+    let repo = env.repo.canonicalize().unwrap();
+    git(&repo, &["init", "-q"]);
+    std::fs::write(repo.join("README.md"), "# Demo\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    // The user already has Gemini settings of their own here.
+    std::fs::create_dir_all(repo.join(".gemini")).unwrap();
+    std::fs::write(
+        repo.join(".gemini/settings.json"),
+        "{\n  \"theme\": \"dark\"\n}\n",
+    )
+    .unwrap();
+
+    let mut init = env.plain_cmd(&repo, None);
+    init.args(["init"]);
+    for id in ["gemini", "cursor", "copilot", "opencode", "pi"] {
+        init.args(["--client", id]);
+    }
+    let out = run_ok(init);
+    assert!(out.contains("pi: pi has no MCP"), "{out}");
+
+    let read = |p: &str| -> Value {
+        serde_json::from_str(&std::fs::read_to_string(repo.join(p)).unwrap()).unwrap()
+    };
+    let gemini = read(".gemini/settings.json");
+    assert_eq!(gemini["theme"], "dark");
+    assert_eq!(
+        gemini["mcpServers"]["chitchat"]["args"],
+        json!(["mcp", "--client", "gemini"])
+    );
+    assert!(
+        gemini["hooks"]["BeforeAgent"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("--client gemini")
+    );
+    assert_eq!(
+        read(".cursor/mcp.json")["mcpServers"]["chitchat"]["type"],
+        "stdio"
+    );
+    assert_eq!(read(".cursor/hooks.json")["version"], 1);
+    assert_eq!(
+        read(".github/mcp.json")["mcpServers"]["chitchat"]["tools"],
+        json!(["*"])
+    );
+    assert!(read(".github/hooks/chitchat.json")["hooks"]["agentStop"][0]["bash"].is_string());
+    assert_eq!(read("opencode.json")["mcp"]["chitchat"]["type"], "local");
+    let skill = std::fs::read_to_string(repo.join(".agents/skills/chitchat/SKILL.md")).unwrap();
+    assert!(skill.contains("chitchat tool"));
+    assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+
+    // A Cursor hook gets Cursor's output format.
+    let agent = FakeClient::start();
+    let mut hook = env.plain_cmd(&repo, Some(agent.pid()));
+    hook.args(["hook", "session-start", "--client", "cursor"]);
+    let stdin =
+        json!({ "workspace_roots": [repo], "conversation_id": "c1", "cursor_version": "2.3" });
+    let out = run_with_stdin(hook, &stdin.to_string());
+    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        reply["additional_context"]
+            .as_str()
+            .unwrap()
+            .contains("You are @cursor-1"),
+        "{reply}"
+    );
+
+    let mut off = env.plain_cmd(&repo, None);
+    off.args(["deinit"]);
+    run_ok(off);
+    assert_eq!(read(".gemini/settings.json"), json!({ "theme": "dark" }));
+    for gone in [
+        ".cursor/mcp.json",
+        ".cursor/hooks.json",
+        ".github/mcp.json",
+        ".github/hooks/chitchat.json",
+        "opencode.json",
+        ".agents/skills/chitchat/SKILL.md",
+    ] {
+        assert!(!repo.join(gone).exists(), "{gone} still there");
+    }
+    assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+}

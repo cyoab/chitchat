@@ -2,7 +2,7 @@
 
 Shared memory and a project group chat for AI coding agents from different vendors.
 
-When several agents (Claude Code and OpenAI Codex CLI) work on the same project in parallel, chitchat gives them:
+When several agents work on the same project in parallel, chitchat gives them the following. It works with Claude Code and OpenAI Codex, plus Gemini CLI, GitHub Copilot CLI, Cursor, OpenCode, pi and more (see [Supported harnesses](#supported-harnesses)).
 
 - **a project chat**: rooms, direct messages, threads and @mentions. Messages carry an intent (`request`, `inform`, `ack`), so agents know when an answer is expected, and requests stay pending until they're answered;
 - **a shared memory**: notes, decisions, gotchas and handoffs that every agent can search, next to your repo's own Markdown docs. Each note records who wrote it and every revision, and an update can't silently overwrite another agent's change;
@@ -47,13 +47,15 @@ chitchat init
 
 **A workspace is a directory.** `init` writes `.chitchat/workspace.json`, and everything below that directory belongs to the workspace. Every git worktree of the repo belongs to it too, so agents in parallel worktrees share one chat and one memory. Each workspace is separate; `chitchat workspaces` lists them. Outside a workspace, chitchat stays off.
 
-**It sets up each installed client for this directory only:**
+**It sets up each installed harness for this directory only.** That means the MCP server, the hooks and the [chitchat skill](#the-chitchat-skill), wherever that harness keeps them. For example:
 
-| Client | MCP server | Hooks |
-|---|---|---|
-| Claude Code | local scope (`claude mcp … --scope local`) | `.claude/settings.local.json` |
-| Codex | `.codex/config.toml` | `.codex/hooks.json` |
+| Harness | MCP server | Hooks | Skill |
+|---|---|---|---|
+| Claude Code | local scope (`claude mcp … --scope local`) | `.claude/settings.local.json` | `.claude/skills/` |
+| Codex | `.codex/config.toml` | `.codex/hooks.json` | `.agents/skills/` |
+| Gemini CLI | `.gemini/settings.json` | `.gemini/settings.json` | `.agents/skills/` |
 
+- `chitchat clients` lists every supported harness and what it gets.
 - None of this shows up in git: `init` lists the files in `.git/info/exclude`.
 - Your existing settings are merged, not replaced. Previous versions are saved to `~/.chitchat/backups/config/`.
 
@@ -68,9 +70,55 @@ Re-running it is safe: it refreshes the configuration and re-imports changed mem
 **Afterwards:**
 - Start new agent sessions. Running sessions don't pick up the change.
 - **Codex:** trust the folder when Codex asks. Then run `/hooks` and trust the chitchat hooks; Codex only runs hooks you've approved.
+- **Other harnesses:** `init` prints any remaining step, such as trusting the folder or approving the MCP server.
 - `chitchat deinit` turns chitchat off for the workspace and keeps its data. `chitchat doctor` shows what's configured.
 
-Flags: `--client claude|codex` (only set up that client), `--name`, `--no-import`, `--no-stop-hook`.
+Flags: `--client <id>` (only set up that harness; repeatable), `--name`, `--no-import`, `--no-stop-hook`.
+
+## Supported harnesses
+
+| Harness | `--client` | What it gets | Status |
+|---|---|---|---|
+| Claude Code | `claude` | MCP tools, automatic delivery (hooks), skill | verified |
+| Codex | `codex` | MCP tools, automatic delivery (hooks), skill | verified |
+| Gemini CLI | `gemini` | MCP tools, automatic delivery, skill | experimental |
+| GitHub Copilot CLI | `copilot` | MCP tools, automatic delivery (not per prompt: Copilot can't add context there), skill | experimental |
+| Cursor | `cursor` | MCP tools, automatic delivery (not per prompt), skill | experimental |
+| Qwen Code | `qwen` | MCP tools, automatic delivery, skill | experimental |
+| Factory Droid | `droid` | MCP tools, automatic delivery, skill | experimental |
+| OpenCode, Amp, Crush, Zed | `opencode`, `amp`, `crush`, `zed` | MCP tools, skill | experimental |
+| Kiro | `kiro` | MCP tools | experimental |
+| Hermes Agent | `hermes` | MCP tools; `init` prints the snippet for `~/.hermes/config.yaml`, since Hermes has no per-project config | experimental |
+| pi | `pi` | shell tools (`chitchat tool`) and the skill; pi has no MCP | experimental |
+
+"Experimental" means the entry follows that harness's documentation and source but hasn't been run end to end yet. Reports welcome.
+
+Two notes:
+- **Without automatic delivery, agents still see waiting messages.** Every chitchat tool result ends with a `[chitchat]` line when messages are waiting, and the skill tells agents to check their inbox.
+- **Cursor also runs Claude Code's hooks.** `chitchat hook` recognizes Cursor and leaves those calls to Cursor's own hooks, so nothing is delivered twice.
+
+## The chitchat skill
+
+`init` installs an [Agent Skill](https://agentskills.io) named `chitchat` for each harness: [`skills/chitchat/SKILL.md`](skills/chitchat/SKILL.md). It teaches agents how to:
+
+- **coordinate:** join with a status, check who's here, claim before editing shared files, and ask the agent who owns something before asking you;
+- **keep shared memory useful:** decisions with their reasons, gotchas and handoffs, written for an agent with no context, and updated instead of duplicated;
+- **finish the work without interrupting you:**
+  - they try the code, the docs, their teammates and reversible defaults first;
+  - they come to you only for decisions that are yours, for approvals your harness requires, and when they're truly stuck;
+  - they still send short progress updates.
+
+## Harnesses without MCP: `chitchat tool`
+
+Every MCP tool is also a command, for agents that only have a shell (like pi):
+
+```sh
+chitchat tool --list --client pi
+chitchat tool post '{"body": "tests pass", "to": "@claude-1"}' --client pi
+chitchat tool inbox --client pi
+```
+
+The agent is identified by the harness process that ran the command, just as with hooks.
 
 ## How it works
 

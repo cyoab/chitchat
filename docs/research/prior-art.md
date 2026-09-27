@@ -256,6 +256,8 @@ panic = "unwind"
 | 7 | How projects are defined | By directory (2026-09-27): `chitchat init` writes `.chitchat/workspace.json`. Subdirectories and linked git worktrees join it; outside a workspace chitchat is off. Client config is per workspace and kept out of git. This replaces user-wide `chitchat install` and project keys derived from git remotes. |
 | 8 | Existing repos | `init` indexes docs, imports Claude Code's per-project memory files as notes, adopts data recorded under old keys, and configures every existing worktree. Codex memories are global (and were empty here), so they aren't imported. |
 | 9 | Backups and distribution | `VACUUM INTO` snapshots, restore through the online backup API, daily automatic backups (7 kept). Tag-triggered GitHub releases for macOS and static-musl Linux, plus a checksum-verifying `install.sh`. |
+| 10 | More harnesses (v0.2) | `src/harness.rs` is a data table: each entry records the harness's identity model, MCP config shape, hook layout, output contract and skill directory. It covers 14 harnesses; only Claude Code and Codex are verified end to end. There are three findings behind the design. None of the other harnesses gives an MCP server a session id, so they use process identity. Cursor runs Claude Code's hooks too, so those calls are recognized and skipped. And almost every harness reads `.agents/skills`. |
+| 11 | Agent skill | One `SKILL.md`, installed per harness by `init`. Agents coordinate through chitchat and finish work without interrupting the human, except for decisions that are genuinely theirs, required approvals, or being stuck. Codex reviewed the text. |
 
 ## Unverified / to test early
 

@@ -14,7 +14,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-use crate::harness::{Harness, Hooks, Mcp};
+use crate::harness::{Entry, Harness, Hooks, Layout, Mcp, Timeout};
 use crate::hook::HookEvent;
 
 pub const SERVER_NAME: &str = "chitchat";
@@ -42,8 +42,8 @@ pub fn local_files(h: &Harness) -> Vec<String> {
         files.push(hooks.file.to_string());
     }
     match &h.mcp {
-        Mcp::ClaudeLocal => {}
-        Mcp::TomlBlock { file } => files.push(file.to_string()),
+        Mcp::TomlBlock { file } | Mcp::Json { file, .. } => files.push(file.to_string()),
+        Mcp::ClaudeLocal | Mcp::Manual { .. } | Mcp::None => {}
     }
     if let Some(dir) = h.skills_dir {
         files.push(format!("{dir}/chitchat/"));
@@ -138,6 +138,28 @@ pub fn configure(target: &Path, h: &Harness, bin: &Path, stop_hook: bool) -> Res
                 done.push(format!("MCP server → {}", path.display()));
             }
         }
+        Mcp::Json {
+            file,
+            servers,
+            entry,
+        } => {
+            let path = target.join(file);
+            let before = read_json(&path)?;
+            let after = with_json_server(before.clone(), servers, json_entry(h, bin, *entry));
+            if write_json(&path, &before, &after)? {
+                done.push(format!("MCP server → {}", path.display()));
+            }
+        }
+        Mcp::Manual { file } => {
+            if !manual_registered(file, h) {
+                done.push(format!(
+                    "MCP server: {} has no per-project config; add this to {file}:\n{}",
+                    h.name,
+                    manual_snippet(h, bin)
+                ));
+            }
+        }
+        Mcp::None => {}
     }
     Ok(done)
 }
@@ -177,6 +199,22 @@ pub fn unconfigure(target: &Path, h: &Harness) -> Result<Vec<String>> {
                 }
             }
         }
+        Mcp::Json { file, servers, .. } => {
+            let path = target.join(file);
+            if path.exists() {
+                let before = read_json(&path)?;
+                let after = without_json_server(before.clone(), servers);
+                if write_json(&path, &before, &after)? {
+                    done.push(format!("removed the MCP server from {}", path.display()));
+                }
+            }
+        }
+        Mcp::Manual { file } => {
+            if manual_registered(file, h) {
+                done.push(format!("remove the chitchat entry from {file} yourself"));
+            }
+        }
+        Mcp::None => {}
     }
     Ok(done)
 }
@@ -211,6 +249,11 @@ pub fn status(target: &Path, h: &Harness) -> Status {
         Mcp::ClaudeLocal => claude_mcp_registered(target),
         Mcp::TomlBlock { file } => std::fs::read_to_string(target.join(file))
             .is_ok_and(|t| t.lines().any(|l| l.trim() == BLOCK_START)),
+        Mcp::Json { file, servers, .. } => read_json(&target.join(file)).ok().is_some_and(|v| {
+            servers_object(&v, servers).is_some_and(|o| o.contains_key(SERVER_NAME))
+        }),
+        Mcp::Manual { file } => manual_registered(file, h),
+        Mcp::None => false,
     };
     let skill = skill_path(target, h)
         .map(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains(SKILL_MARKER)));
@@ -281,6 +324,106 @@ fn claude_mcp_registered(target: &Path) -> bool {
             .get(SERVER_NAME)
             .is_some()
     })
+}
+
+// ---- JSON MCP configs ------------------------------------------------------------
+
+/// One MCP server entry in the harness's JSON shape.
+fn json_entry(h: &Harness, bin: &Path, entry: Entry) -> Value {
+    let command = bin.to_string_lossy().into_owned();
+    let args = mcp_args(h);
+    let env: Map<String, Value> = passthrough_env()
+        .into_iter()
+        .map(|(k, v)| (k, json!(v)))
+        .collect();
+    let mut value = match entry {
+        Entry::Plain => json!({ "command": command, "args": args }),
+        Entry::Typed(kind) => json!({ "type": kind, "command": command, "args": args }),
+        Entry::Copilot => json!({
+            "type": "local", "command": command, "args": args, "env": env.clone(), "tools": ["*"]
+        }),
+        Entry::OpenCode => {
+            let mut cmd = vec![command];
+            cmd.extend(args);
+            let mut v = json!({ "type": "local", "command": cmd, "enabled": true });
+            if !env.is_empty() {
+                v["environment"] = Value::Object(env.clone());
+            }
+            return v;
+        }
+    };
+    if !env.is_empty() && entry != Entry::Copilot {
+        value["env"] = Value::Object(env);
+    }
+    value
+}
+
+fn servers_object<'a>(settings: &'a Value, path: &[&str]) -> Option<&'a Map<String, Value>> {
+    path.iter()
+        .try_fold(settings, |v, key| v.get(*key))?
+        .as_object()
+}
+
+/// Returns `settings` with the chitchat server set at `path`.
+pub fn with_json_server(mut settings: Value, path: &[&str], entry: Value) -> Value {
+    let mut node = ensure_object(&mut settings);
+    for key in path {
+        node = ensure_object(node.entry(*key).or_insert_with(|| json!({})));
+    }
+    node.insert(SERVER_NAME.to_string(), entry);
+    settings
+}
+
+/// Returns `settings` without the chitchat server at `path`, dropping objects
+/// that become empty.
+pub fn without_json_server(mut settings: Value, path: &[&str]) -> Value {
+    fn remove(node: &mut Value, path: &[&str]) {
+        let Some(obj) = node.as_object_mut() else {
+            return;
+        };
+        match path.split_first() {
+            None => {
+                obj.remove(SERVER_NAME);
+            }
+            Some((key, rest)) => {
+                if let Some(child) = obj.get_mut(*key) {
+                    remove(child, rest);
+                    if child.as_object().is_some_and(Map::is_empty) {
+                        obj.remove(*key);
+                    }
+                }
+            }
+        }
+    }
+    remove(&mut settings, path);
+    settings
+}
+
+// ---- harnesses configured by hand -------------------------------------------------
+
+fn manual_snippet(h: &Harness, bin: &Path) -> String {
+    let q = |s: &str| serde_json::to_string(s).unwrap_or_default();
+    let mut out = format!(
+        "  mcp_servers:\n    {SERVER_NAME}:\n      command: {}\n      args: [mcp, --client, {}]\n",
+        q(&bin.to_string_lossy()),
+        h.id
+    );
+    let env = passthrough_env();
+    if !env.is_empty() {
+        out.push_str("      env:\n");
+        for (k, v) in env {
+            out.push_str(&format!("        {k}: {}\n", q(&v)));
+        }
+    }
+    out.trim_end().to_string()
+}
+
+fn manual_registered(file: &str, h: &Harness) -> bool {
+    let path = match file.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir().unwrap_or_default().join(rest),
+        None => PathBuf::from(file),
+    };
+    std::fs::read_to_string(path).is_ok_and(|t| t.contains(&format!("--client, {}]", h.id)))
 }
 
 // ---- managed block in a TOML config (Codex) ------------------------------------
@@ -367,14 +510,29 @@ pub fn hook_command(bin: &Path, event: HookEvent, h: &Harness) -> String {
 
 /// Whether a hook handler was written by chitchat for this harness.
 fn is_ours(handler: &Value, h: &Harness) -> bool {
-    handler
-        .get("command")
-        .and_then(Value::as_str)
-        .is_some_and(|c| {
-            c.contains("chitchat")
-                && c.contains(" hook ")
-                && c.ends_with(&format!("--client {}", h.id))
+    ["command", "bash"].iter().any(|field| {
+        handler
+            .get(*field)
+            .and_then(Value::as_str)
+            .is_some_and(|c| {
+                c.contains("chitchat")
+                    && c.contains(" hook ")
+                    && c.ends_with(&format!("--client {}", h.id))
+            })
+    })
+}
+
+/// Handlers listed under one event: nested in groups (`Grouped`) or directly.
+fn handlers(event_list: &Value) -> Vec<Value> {
+    event_list
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|item| match item.get("hooks").and_then(Value::as_array) {
+            Some(nested) => nested.clone(),
+            None => vec![item.clone()],
         })
+        .collect()
 }
 
 fn count_hooks(settings: &Value, h: &Harness) -> usize {
@@ -384,24 +542,24 @@ fn count_hooks(settings: &Value, h: &Harness) -> usize {
     spec.events
         .iter()
         .filter(|(_, name)| {
-            settings["hooks"][*name]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .flat_map(|g| g["hooks"].as_array().cloned().unwrap_or_default())
-                .any(|handler| is_ours(&handler, h))
+            handlers(&settings["hooks"][*name])
+                .iter()
+                .any(|handler| is_ours(handler, h))
         })
         .count()
 }
 
-/// Returns `settings` with chitchat's hook entries (re)added, in the shared
-/// `{"hooks": {"<Event>": [{"matcher"?, "hooks": [handler]}]}}` layout.
+/// Returns `settings` with chitchat's hook entries (re)added in the harness's
+/// layout (see [`Layout`]).
 pub fn with_hooks(settings: Value, h: &Harness, bin: &Path, stop_hook: bool) -> Value {
     let Some(spec) = &h.hooks else {
         return settings;
     };
     let mut settings = without_hooks(settings, h);
     let root = ensure_object(&mut settings);
+    if spec.layout != Layout::Grouped {
+        root.entry("version").or_insert(json!(1));
+    }
     let hooks = ensure_object(root.entry("hooks").or_insert_with(|| json!({})));
     for &(event, name) in spec.events {
         if event == HookEvent::Stop && !stop_hook {
@@ -419,10 +577,22 @@ pub fn with_hooks(settings: Value, h: &Harness, bin: &Path, stop_hook: bool) -> 
 }
 
 fn hook_group(spec: &Hooks, event: HookEvent, bin: &Path, h: &Harness) -> Value {
+    let command = hook_command(bin, event, h);
+    let timeout = match spec.timeout {
+        Timeout::Seconds => HOOK_TIMEOUT,
+        Timeout::Millis => HOOK_TIMEOUT * 1000,
+    };
+    match spec.layout {
+        Layout::Copilot => {
+            return json!({ "type": "command", "bash": command, "timeoutSec": timeout });
+        }
+        Layout::Flat => return json!({ "command": command, "timeout": timeout }),
+        Layout::Grouped => {}
+    }
     let handler = json!({
         "type": "command",
-        "command": hook_command(bin, event, h),
-        "timeout": HOOK_TIMEOUT,
+        "command": command,
+        "timeout": timeout,
     });
     let mut group = Map::new();
     // After-tool hooks run for every tool, so urgent messages arrive mid-turn.
@@ -450,6 +620,8 @@ pub fn without_hooks(mut settings: Value, h: &Harness) -> Value {
                 handlers.retain(|handler| !is_ours(handler, h));
             }
         }
+        // Flat layouts list handlers directly; grouped ones drop emptied groups.
+        groups.retain(|g| !is_ours(g, h));
         groups.retain(|g| {
             g.get("hooks")
                 .and_then(Value::as_array)
@@ -461,6 +633,10 @@ pub fn without_hooks(mut settings: Value, h: &Harness) -> Value {
         && let Some(root) = settings.as_object_mut()
     {
         root.remove("hooks");
+        // A file left with only a layout version held nothing but chitchat's hooks.
+        if root.len() == 1 && root.contains_key("version") {
+            root.clear();
+        }
     }
     settings
 }
@@ -662,6 +838,65 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "my own chitchat notes"
         );
+    }
+
+    #[test]
+    fn copilot_and_cursor_layouts_round_trip() {
+        use crate::harness::{COPILOT, CURSOR, GEMINI};
+        let copilot = with_hooks(json!({}), &COPILOT, Path::new(BIN), true);
+        assert_eq!(copilot["version"], 1);
+        assert_eq!(copilot["hooks"]["sessionStart"][0]["timeoutSec"], 15);
+        assert!(
+            copilot["hooks"]["agentStop"][0]["bash"]
+                .as_str()
+                .unwrap()
+                .ends_with("--client copilot")
+        );
+        assert!(copilot["hooks"].get("userPromptSubmitted").is_none());
+        assert_eq!(count_hooks(&copilot, &COPILOT), 3);
+        assert_eq!(without_hooks(copilot, &COPILOT), json!({}));
+
+        let user = json!({"version": 1, "hooks": {"stop": [{"command": "notify-send done"}]}});
+        let cursor = with_hooks(user.clone(), &CURSOR, Path::new(BIN), true);
+        assert_eq!(cursor["hooks"]["stop"].as_array().unwrap().len(), 2);
+        assert_eq!(cursor["hooks"]["postToolUse"][0]["timeout"], 15);
+        assert_eq!(without_hooks(cursor, &CURSOR), user);
+
+        let gemini = with_hooks(json!({}), &GEMINI, Path::new(BIN), true);
+        assert_eq!(
+            gemini["hooks"]["BeforeAgent"][0]["hooks"][0]["timeout"],
+            15_000
+        );
+        assert_eq!(gemini["hooks"]["AfterTool"][0]["matcher"], "*");
+    }
+
+    #[test]
+    fn json_mcp_entries_match_each_harness_and_remove_cleanly() {
+        use crate::harness::{AMP, COPILOT, OPENCODE, ZED};
+        let bin = Path::new("/bin/chitchat");
+        let plain = json_entry(&ZED, bin, Entry::Plain);
+        assert_eq!(
+            plain,
+            json!({"command": "/bin/chitchat", "args": ["mcp", "--client", "zed"]})
+        );
+        assert_eq!(
+            json_entry(&COPILOT, bin, Entry::Copilot)["tools"],
+            json!(["*"])
+        );
+        let oc = json_entry(&OPENCODE, bin, Entry::OpenCode);
+        assert_eq!(
+            oc["command"],
+            json!(["/bin/chitchat", "mcp", "--client", "opencode"])
+        );
+        assert_eq!(oc["type"], "local");
+
+        let existing = json!({"theme": "dark", "amp.mcpServers": {"other": {"command": "x"}}});
+        let with = with_json_server(existing.clone(), &["amp.mcpServers"], plain.clone());
+        assert_eq!(with["amp.mcpServers"]["chitchat"], plain);
+        assert_eq!(without_json_server(with, &["amp.mcpServers"]), existing);
+        let fresh = with_json_server(json!({}), &["context_servers"], plain);
+        assert_eq!(without_json_server(fresh, &["context_servers"]), json!({}));
+        let _ = &AMP;
     }
 
     #[test]

@@ -62,16 +62,74 @@ impl HookEvent {
 #[derive(Debug, Default, Deserialize)]
 pub struct HookPayload {
     pub session_id: Option<String>,
+    /// Copilot CLI's camelCase spelling.
+    #[serde(rename = "sessionId")]
+    pub session_id_camel: Option<String>,
+    /// Cursor's per-chat id (sent alongside `session_id` on some events).
+    pub conversation_id: Option<String>,
     pub cwd: Option<String>,
+    /// Cursor sends the workspace roots instead of a cwd.
+    #[serde(default)]
+    pub workspace_roots: Vec<String>,
     /// SessionStart: startup | resume | clear | compact | fork.
     pub source: Option<String>,
     #[serde(default)]
     pub stop_hook_active: bool,
+    /// Cursor: how many times the stop hook already continued the agent.
+    #[serde(default)]
+    pub loop_count: u32,
     pub tool_name: Option<String>,
+    #[serde(rename = "toolName")]
+    pub tool_name_camel: Option<String>,
     #[serde(default)]
     pub tool_input: Value,
+    /// Copilot CLI: the tool's arguments (sometimes as a JSON string).
+    #[serde(default, rename = "toolArgs")]
+    pub tool_args: Value,
     /// Set inside Claude Code subagents; they share the main agent's identity.
     pub agent_id: Option<String>,
+    /// Present when Cursor runs a hook, including Claude Code hooks it imports.
+    pub cursor_version: Option<String>,
+}
+
+impl HookPayload {
+    pub fn session(&self) -> Option<&str> {
+        self.session_id
+            .as_deref()
+            .or(self.session_id_camel.as_deref())
+            .or(self.conversation_id.as_deref())
+    }
+
+    fn cwd(&self) -> Option<&str> {
+        self.cwd
+            .as_deref()
+            .or(self.workspace_roots.first().map(String::as_str))
+    }
+
+    fn tool(&self) -> &str {
+        self.tool_name
+            .as_deref()
+            .or(self.tool_name_camel.as_deref())
+            .unwrap_or_default()
+    }
+
+    /// The tool's input, whichever field and encoding the harness used.
+    fn input(&self) -> Value {
+        let raw = if self.tool_input.is_null() {
+            &self.tool_args
+        } else {
+            &self.tool_input
+        };
+        match raw {
+            Value::String(text) => serde_json::from_str(text).unwrap_or_else(|_| raw.clone()),
+            other => other.clone(),
+        }
+    }
+
+    /// The stop hook already made the agent continue this turn.
+    fn continued(&self) -> bool {
+        self.stop_hook_active || self.loop_count > 0
+    }
 }
 
 /// What the hook tells the client.
@@ -115,13 +173,20 @@ pub fn respond(
     client: &'static Harness,
     payload: &HookPayload,
 ) -> Result<Response> {
-    // Codex keeps continuing as long as a Stop hook blocks; never block twice.
-    if event == HookEvent::Stop && payload.stop_hook_active {
+    // Some harnesses (Codex) keep continuing as long as a stop hook blocks: never
+    // block twice.
+    if event == HookEvent::Stop && payload.continued() {
+        return Ok(Response::Nothing);
+    }
+    // Cursor also runs Claude Code's hooks from .claude/. Those calls would register
+    // a Cursor agent as Claude; Cursor's own hooks handle Cursor.
+    let from_cursor =
+        payload.cursor_version.is_some() || std::env::var_os("CURSOR_VERSION").is_some();
+    if from_cursor && client.id != crate::harness::CURSOR.id {
         return Ok(Response::Nothing);
     }
     let cwd = payload
-        .cwd
-        .as_ref()
+        .cwd()
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from))
         .map_or_else(std::env::current_dir, Ok)?;
@@ -139,7 +204,7 @@ pub fn respond(
         &Caller {
             vendor: client.id,
             client: client_proc.as_ref(),
-            session_id: payload.session_id.as_deref(),
+            session_id: payload.session(),
             session_is_current: true,
             cwd: Some(&cwd_text),
         },
@@ -330,31 +395,34 @@ fn stop_reason(
 /// Claude: Write/Edit/MultiEdit `file_path`, NotebookEdit `notebook_path` (absolute).
 /// Codex: `apply_patch` with the patch text in `tool_input.command` (relative paths).
 pub fn edited_files(payload: &HookPayload) -> Vec<String> {
-    let tool = payload.tool_name.as_deref().unwrap_or_default();
-    let input = &payload.tool_input;
-    let mut files = Vec::new();
-    match tool {
-        "Write" | "Edit" | "MultiEdit" => {
-            if let Some(p) = input.get("file_path").and_then(Value::as_str) {
-                files.push(p.to_string());
-            }
-        }
-        "NotebookEdit" => {
-            if let Some(p) = input.get("notebook_path").and_then(Value::as_str) {
-                files.push(p.to_string());
-            }
-        }
-        "apply_patch" => {
-            let patch = input
-                .get("command")
-                .or_else(|| input.get("input"))
-                .and_then(Value::as_str)
-                .or_else(|| input.as_str())
-                .unwrap_or_default();
-            files.extend(patch_paths(patch));
-        }
-        _ => {}
+    let tool = payload.tool().to_ascii_lowercase();
+    let editing = ["edit", "write", "create", "replace", "patch"]
+        .iter()
+        .any(|word| tool.contains(word));
+    if !editing {
+        return Vec::new();
     }
+    let input = payload.input();
+    let mut files: Vec<String> = [
+        "file_path",
+        "filePath",
+        "notebook_path",
+        "path",
+        "target_file",
+    ]
+    .iter()
+    .filter_map(|key| input.get(*key).and_then(Value::as_str))
+    .map(str::to_string)
+    .collect();
+    if tool.contains("patch") {
+        let patch = ["command", "input", "patch"]
+            .iter()
+            .find_map(|key| input.get(*key).and_then(Value::as_str))
+            .or_else(|| input.as_str())
+            .unwrap_or_default();
+        files.extend(patch_paths(patch));
+    }
+    files.dedup();
     files
 }
 
@@ -383,17 +451,23 @@ pub fn render(event: HookEvent, client: &Harness, response: &Response) -> Option
     let name = spec.event_name(event)?;
     let value = match (spec.output, response) {
         (_, Response::Nothing) => return None,
-        (Output::Claude | Output::Codex, Response::Block(reason)) => {
+        (Output::Claude | Output::Codex | Output::Copilot, Response::Block(reason)) => {
             json!({ "decision": "block", "reason": reason })
         }
+        (Output::Gemini, Response::Block(reason)) => {
+            json!({ "decision": "deny", "reason": reason })
+        }
+        (Output::Cursor, Response::Block(reason)) => json!({ "followup_message": reason }),
         // Codex accepts no hookSpecificOutput on Stop; we never send context there.
         (Output::Codex, Response::Context(_)) if event == HookEvent::Stop => return None,
-        (Output::Claude | Output::Codex, Response::Context(text)) => json!({
+        (Output::Claude | Output::Codex | Output::Gemini, Response::Context(text)) => json!({
             "hookSpecificOutput": {
                 "hookEventName": name,
                 "additionalContext": text,
             }
         }),
+        (Output::Copilot, Response::Context(text)) => json!({ "additionalContext": text }),
+        (Output::Cursor, Response::Context(text)) => json!({ "additional_context": text }),
     };
     Some(value.to_string())
 }
@@ -450,6 +524,73 @@ mod tests {
         assert_eq!(
             render(HookEvent::UserPromptSubmit, &CLAUDE, &Response::Nothing),
             None
+        );
+    }
+
+    #[test]
+    fn payloads_from_other_harnesses_parse() {
+        // Cursor sends both ids and workspace roots instead of a cwd.
+        let cursor: HookPayload = serde_json::from_value(json!({
+            "conversation_id": "conv", "session_id": "sess", "workspace_roots": ["/repo"],
+            "cursor_version": "2.3", "loop_count": 1, "hook_event_name": "stop"
+        }))
+        .unwrap();
+        assert_eq!(cursor.session(), Some("sess"));
+        assert_eq!(cursor.cwd(), Some("/repo"));
+        assert!(cursor.continued());
+
+        // Copilot CLI's camelCase dialect, with tool args as a JSON string.
+        let copilot: HookPayload = serde_json::from_value(json!({
+            "sessionId": "c1", "cwd": "/repo", "toolName": "edit",
+            "toolArgs": "{\"path\": \"src/db.rs\"}"
+        }))
+        .unwrap();
+        assert_eq!(copilot.session(), Some("c1"));
+        assert_eq!(edited_files(&copilot), ["src/db.rs"]);
+
+        let gemini: HookPayload = serde_json::from_value(json!({
+            "session_id": "g", "tool_name": "write_file", "tool_input": {"file_path": "/repo/a.rs"}
+        }))
+        .unwrap();
+        assert_eq!(edited_files(&gemini), ["/repo/a.rs"]);
+    }
+
+    #[test]
+    fn outputs_match_each_harness() {
+        use crate::harness::{COPILOT, CURSOR, GEMINI};
+        let ctx = Response::Context("hi".into());
+        let stop = Response::Block("answer #3".into());
+        assert_eq!(
+            render(HookEvent::UserPromptSubmit, &GEMINI, &ctx).unwrap(),
+            r#"{"hookSpecificOutput":{"hookEventName":"BeforeAgent","additionalContext":"hi"}}"#
+        );
+        assert_eq!(
+            render(HookEvent::Stop, &GEMINI, &stop).unwrap(),
+            r#"{"decision":"deny","reason":"answer #3"}"#
+        );
+        assert_eq!(
+            render(HookEvent::PostToolUse, &COPILOT, &ctx).unwrap(),
+            r#"{"additionalContext":"hi"}"#
+        );
+        assert_eq!(
+            render(HookEvent::SessionStart, &CURSOR, &ctx).unwrap(),
+            r#"{"additional_context":"hi"}"#
+        );
+        assert_eq!(
+            render(HookEvent::Stop, &CURSOR, &stop).unwrap(),
+            r#"{"followup_message":"answer #3"}"#
+        );
+        // Events a harness has no hook for produce nothing.
+        assert_eq!(render(HookEvent::UserPromptSubmit, &CURSOR, &ctx), None);
+    }
+
+    #[test]
+    fn claude_hooks_run_by_cursor_stay_silent() {
+        let payload: HookPayload =
+            serde_json::from_value(json!({"session_id": "s", "cursor_version": "2.3"})).unwrap();
+        assert_eq!(
+            respond(HookEvent::SessionStart, &CLAUDE, &payload).unwrap(),
+            Response::Nothing
         );
     }
 

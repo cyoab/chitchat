@@ -325,29 +325,57 @@ pub fn list() -> Result<()> {
     Ok(())
 }
 
-/// `chitchat clients`: every supported harness, whether it's installed, and how
-/// much of chitchat it gets (MCP tools, automatic delivery through hooks).
+/// `chitchat clients`: every supported harness, whether it's installed, how
+/// much of chitchat it gets, and whether that has been verified end to end.
 pub fn list_clients() -> Result<()> {
+    use crate::harness::Mcp;
     let here = std::env::current_dir()
         .ok()
         .and_then(|cwd| project::detect(&cwd).ok().flatten());
+    println!(
+        "{:<9} {:<19} {:<14} {:<34} STATUS",
+        "ID", "HARNESS", "INSTALLED", "SUPPORT"
+    );
     for h in harness::ALL {
-        let installed = if h.available() {
-            "installed"
+        let installed = if h.available() { "yes" } else { "no" };
+        let tools = match h.mcp {
+            Mcp::None => "shell tools",
+            Mcp::Manual { .. } => "MCP (manual setup)",
+            _ => "MCP tools",
+        };
+        let delivery = if h.hooks.is_some() {
+            " + auto delivery"
         } else {
-            "not installed"
+            ""
         };
-        let delivery = match &h.hooks {
-            Some(spec) => format!("hooks: {}", spec.events.len()),
-            None => "no hooks (tools only)".to_string(),
+        let skill = if h.skills_dir.is_some() {
+            " + skill"
+        } else {
+            ""
         };
-        let here = match &here {
-            Some(p) if clients::status(&p.root, h).configured() => ", set up here",
-            _ => "",
-        };
-        println!("{:<9} {:<18} {installed}{here} · {delivery}", h.id, h.name);
+        let mut status = if h.verified {
+            "verified"
+        } else {
+            "experimental"
+        }
+        .to_string();
+        if let Some(p) = &here
+            && clients::status(&p.root, h).configured()
+        {
+            status.push_str(", set up here");
+        }
+        println!(
+            "{:<9} {:<19} {installed:<14} {:<34} {status}",
+            h.id,
+            h.name,
+            format!("{tools}{delivery}{skill}")
+        );
     }
-    println!("\nSet up a workspace for one of them with `chitchat init --client <id>`.");
+    println!(
+        "\nSet up a workspace with `chitchat init` (all installed harnesses) or \
+         `chitchat init --client <id>`. Experimental entries follow each harness's \
+         documentation but haven't been run end to end yet."
+    );
     Ok(())
 }
 
