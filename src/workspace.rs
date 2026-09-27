@@ -22,14 +22,14 @@ use crate::agents;
 use crate::clients;
 use crate::db::now_ms;
 use crate::format;
+use crate::harness::{self, Harness};
 use crate::memory;
 use crate::project::{self, Marker, canonical};
-use crate::session::Client;
 
 #[derive(Debug, Clone)]
 pub struct InitOptions {
     /// Clients to configure; empty means every one that's installed.
-    pub clients: Vec<Client>,
+    pub clients: Vec<&'static Harness>,
     pub import: bool,
     pub stop_hook: bool,
     pub name: Option<String>,
@@ -80,23 +80,24 @@ pub fn init(path: Option<&Path>, opts: &InitOptions) -> Result<()> {
     let targets = targets(&dir, &found);
     let clients = pick_clients(&opts.clients);
     let bin = clients::binary_path()?;
-    for client in [Client::Claude, Client::Codex] {
-        if !clients.contains(&client) {
-            if opts.clients.is_empty() {
-                println!(
-                    "{}: not installed (CLI not on PATH), skipped",
-                    clients::name(client)
-                );
-            }
-            continue;
-        }
-        println!("{}:", clients::name(client));
+    for &h in &clients {
+        println!("{}:", h.name);
         for target in &targets {
-            match clients::configure(target, client, &bin, opts.stop_hook) {
+            match clients::configure(target, h, &bin, opts.stop_hook) {
                 Ok(done) if done.is_empty() => println!("  {}: already set up", target.display()),
                 Ok(done) => done.iter().for_each(|d| println!("  {d}")),
                 Err(e) => println!("  {}: {e:#}", target.display()),
             }
+        }
+    }
+    if opts.clients.is_empty() {
+        let missing: Vec<&str> = harness::ALL
+            .iter()
+            .filter(|h| !clients.iter().any(|c| c.id == h.id))
+            .map(|h| h.name)
+            .collect();
+        if !missing.is_empty() {
+            println!("Not installed here (skipped): {}", missing.join(", "));
         }
     }
 
@@ -104,7 +105,7 @@ pub fn init(path: Option<&Path>, opts: &InitOptions) -> Result<()> {
     for target in &targets {
         let mut files: Vec<&str> = clients
             .iter()
-            .flat_map(|c| clients::local_files(*c).iter().copied())
+            .flat_map(|c| clients::local_files(c))
             .collect();
         files.push(".chitchat/");
         excluded.extend(clients::exclude_from_git(target, &files)?);
@@ -135,13 +136,11 @@ pub fn init(path: Option<&Path>, opts: &InitOptions) -> Result<()> {
     }
 
     println!("\nNext:");
-    println!(
-        "  - Start new Claude Code / Codex sessions here (running ones don't pick up the change)."
-    );
-    if clients.contains(&Client::Codex) {
-        println!(
-            "  - Codex: trust this folder when asked, then run /hooks and trust the chitchat hooks."
-        );
+    println!("  - Start new agent sessions here (running ones don't pick up the change).");
+    for h in &clients {
+        if let Some(note) = h.setup_note {
+            println!("  - {}: {note}", h.name);
+        }
     }
     if matches!(found, Found::Created | Found::Existing) {
         println!("  - New git worktree later? Run `chitchat init` inside it.");
@@ -193,13 +192,14 @@ fn targets(dir: &Path, found: &Found) -> Vec<PathBuf> {
     out
 }
 
-fn pick_clients(requested: &[Client]) -> Vec<Client> {
+fn pick_clients(requested: &[&'static Harness]) -> Vec<&'static Harness> {
     if !requested.is_empty() {
         return requested.to_vec();
     }
-    [Client::Claude, Client::Codex]
-        .into_iter()
-        .filter(|c| clients::available(*c))
+    harness::ALL
+        .iter()
+        .copied()
+        .filter(|h| h.available())
         .collect()
 }
 
@@ -242,7 +242,7 @@ pub use crate::import::claude_project_dir_name;
 
 /// Turns chitchat off for the workspace containing `path` (and its worktrees),
 /// keeping its data.
-pub fn deinit(path: Option<&Path>, requested: &[Client]) -> Result<()> {
+pub fn deinit(path: Option<&Path>, requested: &[&'static Harness]) -> Result<()> {
     let start = canonical(&match path {
         Some(p) => p.to_path_buf(),
         None => std::env::current_dir()?,
@@ -255,18 +255,16 @@ pub fn deinit(path: Option<&Path>, requested: &[Client]) -> Result<()> {
     } else {
         Found::Joined(PathBuf::new())
     };
-    let clients = if requested.is_empty() {
-        vec![Client::Claude, Client::Codex]
+    let clients: Vec<&'static Harness> = if requested.is_empty() {
+        harness::ALL.to_vec()
     } else {
         requested.to_vec()
     };
     for target in targets(&project.root, &found) {
-        for client in &clients {
-            match clients::unconfigure(&target, *client) {
-                Ok(done) => done
-                    .iter()
-                    .for_each(|d| println!("{}: {d}", clients::name(*client))),
-                Err(e) => println!("{}: {e:#}", clients::name(*client)),
+        for h in &clients {
+            match clients::unconfigure(&target, h) {
+                Ok(done) => done.iter().for_each(|d| println!("{}: {d}", h.name)),
+                Err(e) => println!("{}: {e:#}", h.name),
             }
         }
     }
@@ -321,6 +319,32 @@ pub fn list() -> Result<()> {
             format::ago(last_message.unwrap_or(updated))
         );
     }
+    Ok(())
+}
+
+/// `chitchat clients`: every supported harness, whether it's installed, and how
+/// much of chitchat it gets (MCP tools, automatic delivery through hooks).
+pub fn list_clients() -> Result<()> {
+    let here = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| project::detect(&cwd).ok().flatten());
+    for h in harness::ALL {
+        let installed = if h.available() {
+            "installed"
+        } else {
+            "not installed"
+        };
+        let delivery = match &h.hooks {
+            Some(spec) => format!("hooks: {}", spec.events.len()),
+            None => "no hooks (tools only)".to_string(),
+        };
+        let here = match &here {
+            Some(p) if clients::status(&p.root, h).configured() => ", set up here",
+            _ => "",
+        };
+        println!("{:<9} {:<18} {installed}{here} · {delivery}", h.id, h.name);
+    }
+    println!("\nSet up a workspace for one of them with `chitchat init --client <id>`.");
     Ok(())
 }
 

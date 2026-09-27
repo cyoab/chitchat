@@ -766,20 +766,13 @@ mod tests {
         self,
         tests::{caller, proc, project},
     };
-    use crate::session::Vendor;
 
     fn setup() -> (tempfile::TempDir, Connection, i64, Agent, Agent) {
         let dir = tempfile::tempdir().unwrap();
         let mut conn = crate::db::open(&dir.path().join("t.db")).unwrap();
         let pid = project(&conn);
-        let a = agents::resolve(
-            &mut conn,
-            pid,
-            &caller(Vendor::Claude, Some(&proc(1)), None),
-        )
-        .unwrap();
-        let b =
-            agents::resolve(&mut conn, pid, &caller(Vendor::Codex, Some(&proc(2)), None)).unwrap();
+        let a = agents::resolve(&mut conn, pid, &caller("claude", Some(&proc(1)), None)).unwrap();
+        let b = agents::resolve(&mut conn, pid, &caller("codex", Some(&proc(2)), None)).unwrap();
         (dir, conn, pid, a, b)
     }
 

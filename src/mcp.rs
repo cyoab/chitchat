@@ -20,10 +20,11 @@ use crate::agents::{self, Agent, Caller};
 use crate::chat::{self, Intent, NewMessage};
 use crate::claims;
 use crate::digest;
+use crate::harness::Harness;
 use crate::memory::{self, Hit, NoteInput, Saved, Scope, Sources};
 use crate::procs::{self, ProcInfo};
 use crate::project::Project;
-use crate::session::{Client, SessionHint, Vendor};
+use crate::session::SessionHint;
 
 const INSTRUCTIONS: &str = "\
 chitchat connects you with the other AI agents (Claude Code and Codex sessions) working on \
@@ -55,7 +56,7 @@ pub struct ChitchatServer {
     db: Mutex<Connection>,
     /// None when the server was started outside any chitchat workspace.
     ws: Option<Workspace>,
-    vendor: Vendor,
+    harness: &'static Harness,
     client: Option<ProcInfo>,
     session: SessionHint,
     docs_refreshed: Mutex<Option<Instant>>,
@@ -574,14 +575,14 @@ impl ChitchatServer {
     pub fn new(
         db: Connection,
         ws: Option<Workspace>,
-        vendor: Vendor,
+        harness: &'static Harness,
         client: Option<ProcInfo>,
         session: SessionHint,
     ) -> Self {
         Self {
             db: Mutex::new(db),
             ws,
-            vendor,
+            harness,
             client,
             session,
             docs_refreshed: Mutex::new(None),
@@ -638,7 +639,7 @@ impl ChitchatServer {
             conn,
             ws.id,
             &Caller {
-                vendor: self.vendor,
+                vendor: self.harness.id,
                 client: self.client.as_ref(),
                 session_id: session_id.as_deref(),
                 session_is_current: current,
@@ -667,20 +668,17 @@ impl ChitchatServer {
 }
 
 /// Runs the server on stdin/stdout until the client disconnects.
-pub fn run(client: Option<Client>) -> Result<()> {
+pub fn run(client: Option<&'static Harness>) -> Result<()> {
     let session = SessionHint::from_env();
     let client_proc = procs::client_process(None);
-    let vendor = client
-        .map(Vendor::from)
-        .or(session.vendor)
+    let harness = client
+        .or(session.harness)
         .or_else(|| {
             client_proc
                 .as_ref()
-                .and_then(|p| crate::session::vendor_from_process(&p.name))
+                .and_then(|p| Harness::from_process_name(&p.name))
         })
-        .context(
-            "could not tell which client launched chitchat; pass --client claude or --client codex",
-        )?;
+        .context("could not tell which agent harness launched chitchat; pass --client <id>")?;
     let cwd = match &session.project_dir {
         Some(dir) => dir.clone(),
         None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -693,7 +691,7 @@ pub fn run(client: Option<Client>) -> Result<()> {
         }
         None => None,
     };
-    tracing::info!(project = ?ws.as_ref().map(|w| &w.project.key), ?vendor, client = ?client_proc, "starting MCP server");
+    tracing::info!(project = ?ws.as_ref().map(|w| &w.project.key), harness = harness.id, client = ?client_proc, "starting MCP server");
     match crate::backup::auto(&db) {
         Ok(Some(path)) => tracing::info!("daily backup written to {}", path.display()),
         Ok(None) => {}
@@ -702,7 +700,7 @@ pub fn run(client: Option<Client>) -> Result<()> {
 
     crate::update::spawn_auto_check();
 
-    let server = ChitchatServer::new(db, ws, vendor, client_proc, session);
+    let server = ChitchatServer::new(db, ws, harness, client_proc, session);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

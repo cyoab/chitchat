@@ -25,11 +25,7 @@ pub fn who(
     let leases = claims::active(conn, project_id)?;
     let mut out = format!("Project {} [{}]\n", project.name, project.key);
     if let Some(me) = me {
-        out.push_str(&format!(
-            "You are @{} ({}).\n",
-            me.handle,
-            me.vendor.as_str()
-        ));
+        out.push_str(&format!("You are @{} ({}).\n", me.handle, me.vendor));
     }
 
     let (online, offline): (Vec<&Agent>, Vec<&Agent>) =
@@ -71,7 +67,7 @@ pub fn who(
 }
 
 fn describe(a: &Agent, leases: &[claims::Lease]) -> String {
-    let mut line = format!("@{} ({})", a.handle, a.vendor.as_str());
+    let mut line = format!("@{} ({})", a.handle, a.vendor);
     if a.is_human() {
         line.push_str(" · the human you work for");
         return line;

@@ -3,8 +3,8 @@
 use anyhow::Result;
 
 use crate::clients;
-use crate::hook::HookEvent;
-use crate::session::{Client, SessionHint};
+use crate::harness;
+use crate::session::SessionHint;
 
 pub fn run() -> Result<()> {
     let db_path = crate::paths::db_path()?;
@@ -39,9 +39,9 @@ pub fn run() -> Result<()> {
         ),
         None => println!("backups   none yet (`chitchat backup`)"),
     }
-    match (session.vendor, session.session_id) {
-        (Some(vendor), Some(id)) => println!("session   {} {id}", vendor.as_str()),
-        (Some(vendor), None) => println!("session   {} (no session id)", vendor.as_str()),
+    match (session.harness, session.session_id) {
+        (Some(h), Some(id)) => println!("session   {} {id}", h.id),
+        (Some(h), None) => println!("session   {} (no session id)", h.id),
         _ => println!("session   none detected (not running inside an agent)"),
     }
 
@@ -51,27 +51,25 @@ pub fn run() -> Result<()> {
     };
     println!("workspace {} [{}]", project.name, project.key);
     println!("root      {}", project.root.display());
-    for client in [Client::Claude, Client::Codex] {
-        let s = clients::status(&project.root, client);
-        let label = if client == Client::Claude {
-            "claude"
+    for h in harness::ALL {
+        let s = clients::status(&project.root, h);
+        if !h.available() && !s.configured() {
+            continue;
+        }
+        let installed = if h.available() { "" } else { " (not on PATH)" };
+        let hooks = if s.hook_events == 0 {
+            "no hook support".to_string()
         } else {
-            "codex "
-        };
-        let installed = if clients::available(client) {
-            ""
-        } else {
-            " (CLI not on PATH)"
+            format!("hooks {}/{}", s.hooks, s.hook_events)
         };
         println!(
-            "{label}    MCP server {}; hooks {}/{}{installed}",
+            "{:<9} MCP server {}; {hooks}{installed}",
+            h.id,
             if s.mcp {
                 "configured"
             } else {
                 "not configured"
             },
-            s.hooks,
-            HookEvent::ALL.len()
         );
     }
     Ok(())

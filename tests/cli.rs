@@ -427,7 +427,7 @@ fn doctor_reports_schema_and_project() {
     let env = Env::new();
     let text = env.cli(&["doctor"]);
     assert!(text.contains("journal: wal"), "{text}");
-    assert!(text.contains("schema    v1"), "{text}");
+    assert!(text.contains("schema    v2"), "{text}");
     assert!(text.contains("demo [example.com/team/demo]"), "{text}");
 }
 

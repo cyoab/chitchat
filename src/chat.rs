@@ -626,7 +626,6 @@ pub fn search(
 mod tests {
     use super::*;
     use crate::agents::tests::{caller, proc, project};
-    use crate::session::Vendor;
 
     struct World {
         _dir: tempfile::TempDir,
@@ -646,7 +645,7 @@ mod tests {
     }
 
     /// Agents need a live client process to receive room messages.
-    fn live_agent(w: &mut World, vendor: Vendor, child: &std::process::Child) -> Agent {
+    fn live_agent(w: &mut World, vendor: &str, child: &std::process::Child) -> Agent {
         let info = crate::procs::info(child.id()).unwrap();
         agents::resolve(&mut w.conn, w.project, &caller(vendor, Some(&info), None)).unwrap()
     }
@@ -681,13 +680,13 @@ mod tests {
     fn room_messages_reach_online_agents_and_requests_stay_pending_until_answered() {
         let mut w = world();
         let (mut p1, mut p2) = (sleeper(), sleeper());
-        let claude = live_agent(&mut w, Vendor::Claude, &p1);
-        let codex = live_agent(&mut w, Vendor::Codex, &p2);
+        let claude = live_agent(&mut w, "claude", &p1);
+        let codex = live_agent(&mut w, "codex", &p2);
         // An agent whose process is gone gets nothing.
         let gone = agents::resolve(
             &mut w.conn,
             w.project,
-            &caller(Vendor::Codex, Some(&proc(999_998)), None),
+            &caller("codex", Some(&proc(999_998)), None),
         )
         .unwrap();
 
@@ -758,8 +757,8 @@ mod tests {
     fn replies_to_direct_messages_go_back_to_the_sender() {
         let mut w = world();
         let (mut p1, mut p2) = (sleeper(), sleeper());
-        let claude = live_agent(&mut w, Vendor::Claude, &p1);
-        let codex = live_agent(&mut w, Vendor::Codex, &p2);
+        let claude = live_agent(&mut w, "claude", &p1);
+        let codex = live_agent(&mut w, "codex", &p2);
 
         let dm = post(
             &mut w.conn,
@@ -797,12 +796,12 @@ mod tests {
     fn replies_reach_the_asker_even_when_offline() {
         let mut w = world();
         let mut p = sleeper();
-        let codex = live_agent(&mut w, Vendor::Codex, &p);
+        let codex = live_agent(&mut w, "codex", &p);
         // The asker's process has exited (e.g. a finished `claude -p` run).
         let asker = agents::resolve(
             &mut w.conn,
             w.project,
-            &caller(Vendor::Claude, Some(&proc(999_997)), Some("s1")),
+            &caller("claude", Some(&proc(999_997)), Some("s1")),
         )
         .unwrap();
         let q = say(&mut w, &asker, "anyone?");
@@ -836,7 +835,7 @@ mod tests {
         let me = agents::resolve(
             &mut w.conn,
             w.project,
-            &caller(Vendor::Claude, Some(&proc(1)), None),
+            &caller("claude", Some(&proc(1)), None),
         )
         .unwrap();
         say(&mut w, &me, "hello");
@@ -869,8 +868,8 @@ mod tests {
     fn take_unread_respects_budget_and_urgency() {
         let mut w = world();
         let (mut p1, mut p2) = (sleeper(), sleeper());
-        let claude = live_agent(&mut w, Vendor::Claude, &p1);
-        let codex = live_agent(&mut w, Vendor::Codex, &p2);
+        let claude = live_agent(&mut w, "claude", &p1);
+        let codex = live_agent(&mut w, "codex", &p2);
         say(&mut w, &claude, "fyi one");
         say(&mut w, &claude, "@codex-1 urgent two");
         say(&mut w, &claude, "fyi three");

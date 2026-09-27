@@ -12,7 +12,10 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, TransactionBehavior};
 
 /// Schema migrations, applied in order. Index `i` brings the schema to version `i + 1`.
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_any_harness.sql"),
+];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
 
@@ -78,6 +81,16 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     if schema_version(conn)? == SCHEMA_VERSION {
         return Ok(());
     }
+    // Rebuilding a table (the only way to change a constraint in SQLite) needs
+    // foreign-key enforcement off, and that can only be switched outside a
+    // transaction. Integrity is checked before committing instead.
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let result = apply_pending(conn);
+    conn.pragma_update(None, "foreign_keys", true)?;
+    result
+}
+
+fn apply_pending(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current = schema_version(&tx)?;
     if current > SCHEMA_VERSION {
@@ -88,6 +101,12 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
         tx.execute_batch(sql)
             .with_context(|| format!("applying migration {}", i + 1))?;
+    }
+    let broken: i64 = tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+        r.get(0)
+    })?;
+    if broken > 0 {
+        bail!("migration left {broken} broken foreign key references; not applied");
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -170,6 +189,55 @@ mod tests {
                 assert_eq!(handle.join().unwrap().unwrap(), SCHEMA_VERSION);
             }
         }
+    }
+
+    #[test]
+    fn upgrading_from_v1_keeps_agents_and_their_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.db");
+        // Build a v1 database with an agent that has sent a message.
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(MIGRATIONS[0]).unwrap();
+            tx.pragma_update(None, "user_version", 1).unwrap();
+            tx.execute_batch(
+                "INSERT INTO projects (id, key, name, created_at, updated_at) VALUES (1, 'ws:x', 'x', 0, 0);
+                 INSERT INTO agents (id, project_id, handle, vendor, created_at, last_seen_at)
+                     VALUES (7, 1, 'codex-1', 'codex', 0, 0);
+                 INSERT INTO messages (project_id, sender_id, room, intent, body, created_at)
+                     VALUES (1, 7, 'general', 'inform', 'hi', 0);",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let (handle, body): (String, String) = conn
+            .query_row(
+                "SELECT a.handle, m.body FROM messages m JOIN agents a ON a.id = m.sender_id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((handle.as_str(), body.as_str()), ("codex-1", "hi"));
+        // Any harness id is now accepted, and foreign keys are enforced again.
+        conn.execute(
+            "INSERT INTO agents (project_id, handle, vendor, created_at, last_seen_at)
+             VALUES (1, 'gemini-1', 'gemini', 0, 0)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO agents (project_id, handle, vendor, created_at, last_seen_at)
+                 VALUES (99, 'x-1', 'x', 0, 0)",
+                [],
+            )
+            .is_err()
+        );
     }
 
     #[test]

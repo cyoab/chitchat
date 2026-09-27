@@ -297,7 +297,6 @@ pub fn conflicts_for(
 mod tests {
     use super::*;
     use crate::agents::tests::{caller, project};
-    use crate::session::Vendor;
 
     #[test]
     fn normalizes_paths_and_tasks() {
@@ -338,9 +337,8 @@ mod tests {
             .spawn()
             .unwrap();
         let other = crate::procs::info(child.id()).unwrap();
-        let a = agents::resolve(&mut conn, pid, &caller(Vendor::Claude, Some(&me), None)).unwrap();
-        let b =
-            agents::resolve(&mut conn, pid, &caller(Vendor::Codex, Some(&other), None)).unwrap();
+        let a = agents::resolve(&mut conn, pid, &caller("claude", Some(&me), None)).unwrap();
+        let b = agents::resolve(&mut conn, pid, &caller("codex", Some(&other), None)).unwrap();
         let root = dir.path();
 
         let got = claim(

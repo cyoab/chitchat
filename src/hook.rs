@@ -18,9 +18,9 @@ use crate::agents::{self, Agent, Caller};
 use crate::chat::{self, Deliver};
 use crate::claims;
 use crate::digest::{self, DIGEST_BODY_CHARS};
+use crate::harness::{Harness, Output};
 use crate::procs;
 use crate::project::Project;
-use crate::session::{Client, Vendor};
 
 /// Rendered-text budgets. Claude caps injected context at 10,000 characters and
 /// Codex spills past ~2,500 tokens to a file, so stay well under both.
@@ -41,15 +41,6 @@ pub enum HookEvent {
 }
 
 impl HookEvent {
-    fn name(self) -> &'static str {
-        match self {
-            HookEvent::SessionStart => "SessionStart",
-            HookEvent::UserPromptSubmit => "UserPromptSubmit",
-            HookEvent::PostToolUse => "PostToolUse",
-            HookEvent::Stop => "Stop",
-        }
-    }
-
     pub fn arg(self) -> &'static str {
         match self {
             HookEvent::SessionStart => "session-start",
@@ -93,7 +84,7 @@ pub enum Response {
     Block(String),
 }
 
-pub fn run(event: HookEvent, client: Client) {
+pub fn run(event: HookEvent, client: &'static Harness) {
     match handle(event, client) {
         Ok(response) => {
             if let Some(out) = render(event, client, &response) {
@@ -104,7 +95,7 @@ pub fn run(event: HookEvent, client: Client) {
     }
 }
 
-fn handle(event: HookEvent, client: Client) -> Result<Response> {
+fn handle(event: HookEvent, client: &'static Harness) -> Result<Response> {
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
@@ -119,7 +110,11 @@ fn handle(event: HookEvent, client: Client) -> Result<Response> {
 }
 
 /// Decides the response for one hook invocation.
-pub fn respond(event: HookEvent, client: Client, payload: &HookPayload) -> Result<Response> {
+pub fn respond(
+    event: HookEvent,
+    client: &'static Harness,
+    payload: &HookPayload,
+) -> Result<Response> {
     // Codex keeps continuing as long as a Stop hook blocks; never block twice.
     if event == HookEvent::Stop && payload.stop_hook_active {
         return Ok(Response::Nothing);
@@ -136,14 +131,13 @@ pub fn respond(event: HookEvent, client: Client, payload: &HookPayload) -> Resul
     };
     let mut conn = crate::db::open_default()?;
     let project_id = agents::ensure_project(&conn, &project)?;
-    let pid_env = (client == Client::Claude).then_some("CLAUDE_PID");
-    let client_proc = procs::client_process(pid_env);
+    let client_proc = procs::client_process(client.hook_pid_env);
     let cwd_text = cwd.to_string_lossy();
     let me = agents::resolve(
         &mut conn,
         project_id,
         &Caller {
-            vendor: Vendor::from(client),
+            vendor: client.id,
             client: client_proc.as_ref(),
             session_id: payload.session_id.as_deref(),
             session_is_current: true,
@@ -383,21 +377,23 @@ fn patch_paths(patch: &str) -> Vec<String> {
         .collect()
 }
 
-/// The exact stdout each client accepts for this event, or None for no output.
-pub fn render(event: HookEvent, client: Client, response: &Response) -> Option<String> {
-    let value = match response {
-        Response::Nothing => return None,
-        Response::Block(reason) => json!({ "decision": "block", "reason": reason }),
-        Response::Context(text) => match (client, event) {
-            // Codex accepts no hookSpecificOutput on Stop; we never send context there.
-            (Client::Codex, HookEvent::Stop) => return None,
-            _ => json!({
-                "hookSpecificOutput": {
-                    "hookEventName": event.name(),
-                    "additionalContext": text,
-                }
-            }),
-        },
+/// The exact stdout this harness accepts for this event, or None for no output.
+pub fn render(event: HookEvent, client: &Harness, response: &Response) -> Option<String> {
+    let spec = client.hooks.as_ref()?;
+    let name = spec.event_name(event)?;
+    let value = match (spec.output, response) {
+        (_, Response::Nothing) => return None,
+        (Output::Claude | Output::Codex, Response::Block(reason)) => {
+            json!({ "decision": "block", "reason": reason })
+        }
+        // Codex accepts no hookSpecificOutput on Stop; we never send context there.
+        (Output::Codex, Response::Context(_)) if event == HookEvent::Stop => return None,
+        (Output::Claude | Output::Codex, Response::Context(text)) => json!({
+            "hookSpecificOutput": {
+                "hookEventName": name,
+                "additionalContext": text,
+            }
+        }),
     };
     Some(value.to_string())
 }
@@ -405,6 +401,7 @@ pub fn render(event: HookEvent, client: Client, response: &Response) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::{CLAUDE, CODEX};
 
     #[test]
     fn edited_files_from_both_clients() {
@@ -437,25 +434,21 @@ mod tests {
     fn output_shapes_match_each_client() {
         let ctx = Response::Context("hi".into());
         assert_eq!(
-            render(HookEvent::PostToolUse, Client::Codex, &ctx).unwrap(),
+            render(HookEvent::PostToolUse, &CODEX, &ctx).unwrap(),
             r#"{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"hi"}}"#
         );
         assert_eq!(
             render(
                 HookEvent::Stop,
-                Client::Claude,
+                &CLAUDE,
                 &Response::Block("answer #3".into())
             )
             .unwrap(),
             r#"{"decision":"block","reason":"answer #3"}"#
         );
-        assert_eq!(render(HookEvent::Stop, Client::Codex, &ctx), None);
+        assert_eq!(render(HookEvent::Stop, &CODEX, &ctx), None);
         assert_eq!(
-            render(
-                HookEvent::UserPromptSubmit,
-                Client::Claude,
-                &Response::Nothing
-            ),
+            render(HookEvent::UserPromptSubmit, &CLAUDE, &Response::Nothing),
             None
         );
     }
@@ -467,7 +460,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            respond(HookEvent::Stop, Client::Codex, &payload).unwrap(),
+            respond(HookEvent::Stop, &CODEX, &payload).unwrap(),
             Response::Nothing
         );
     }

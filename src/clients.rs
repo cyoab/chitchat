@@ -1,15 +1,12 @@
-//! Per-directory client configuration written by `chitchat init`.
+//! Per-directory harness configuration written by `chitchat init`, driven by the
+//! table in [`crate::harness`].
 //!
 //! Everything is local to this machine and kept out of git (via
-//! `.git/info/exclude`), since it points at this machine's chitchat binary:
-//! - Claude Code: the MCP server at *local* scope (`claude mcp add-json --scope
-//!   local`, stored in ~/.claude.json for this directory only) and hooks in
-//!   `.claude/settings.local.json`.
-//! - Codex: a managed `[mcp_servers.chitchat]` block in `.codex/config.toml` and
-//!   hooks in `.codex/hooks.json` (Codex loads both once the project is trusted).
-//!
-//! Hook files are merged, keeping everything else; chitchat's entries are
-//! recognized by their command line, so re-running replaces rather than duplicates.
+//! `.git/info/exclude`), since it points at this machine's chitchat binary. Hook
+//! and MCP files are merged, keeping everything else; chitchat's entries are
+//! recognized by their command line, so re-running replaces rather than
+//! duplicates them. Previous versions of edited files are saved under
+//! `~/.chitchat/backups/config/`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,8 +14,8 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
+use crate::harness::{Harness, Hooks, Mcp};
 use crate::hook::HookEvent;
-use crate::session::Client;
 
 pub const SERVER_NAME: &str = "chitchat";
 /// Seconds. The hook itself is fast; this only bounds a stuck database lock.
@@ -28,51 +25,27 @@ const BLOCK_START: &str =
     "# >>> chitchat: managed by `chitchat init`; edits inside this block are overwritten";
 const BLOCK_END: &str = "# <<< chitchat";
 
-pub fn name(client: Client) -> &'static str {
-    match client {
-        Client::Claude => "Claude Code",
-        Client::Codex => "Codex",
-    }
-}
-
-fn client_arg(client: Client) -> &'static str {
-    match client {
-        Client::Claude => "claude",
-        Client::Codex => "codex",
-    }
-}
-
-/// Whether the client's CLI is installed (on PATH).
-pub fn available(client: Client) -> bool {
-    on_path(client_arg(client))
-}
-
 pub fn binary_path() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("locating the chitchat binary")?;
     Ok(exe.canonicalize().unwrap_or(exe))
 }
 
-fn hooks_file(target: &Path, client: Client) -> PathBuf {
-    match client {
-        Client::Claude => target.join(".claude").join("settings.local.json"),
-        Client::Codex => target.join(".codex").join("hooks.json"),
+/// Files `configure` may create inside the workspace directory, relative to it.
+pub fn local_files(h: &Harness) -> Vec<&'static str> {
+    let mut files = Vec::new();
+    if let Some(hooks) = &h.hooks {
+        files.push(hooks.file);
     }
-}
-
-fn codex_config(target: &Path) -> PathBuf {
-    target.join(".codex").join("config.toml")
-}
-
-/// Files `configure` may create inside `target`, relative to it.
-pub fn local_files(client: Client) -> &'static [&'static str] {
-    match client {
-        Client::Claude => &[".claude/settings.local.json"],
-        Client::Codex => &[".codex/hooks.json", ".codex/config.toml"],
+    match &h.mcp {
+        Mcp::ClaudeLocal => {}
+        Mcp::TomlBlock { file } => files.push(file),
     }
+    files.dedup();
+    files
 }
 
-/// Env vars worth passing to the MCP server. Codex starts MCP servers with a
-/// scrubbed environment, so these must be set explicitly there.
+/// Env vars worth passing to the MCP server. Some harnesses (Codex) start MCP
+/// servers with a scrubbed environment, so these must be set explicitly.
 fn passthrough_env() -> Vec<(String, String)> {
     ["CHITCHAT_HOME", "CHITCHAT_LOG"]
         .iter()
@@ -80,29 +53,34 @@ fn passthrough_env() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Sets `client` up to use chitchat in `target`. Returns a line per change made.
-pub fn configure(
-    target: &Path,
-    client: Client,
-    bin: &Path,
-    stop_hook: bool,
-) -> Result<Vec<String>> {
+/// The command line an MCP config launches.
+fn mcp_args(h: &Harness) -> [String; 3] {
+    ["mcp".to_string(), "--client".to_string(), h.id.to_string()]
+}
+
+/// Sets `h` up to use chitchat in `target`. Returns a line per change made.
+pub fn configure(target: &Path, h: &Harness, bin: &Path, stop_hook: bool) -> Result<Vec<String>> {
     let mut done = Vec::new();
-    let hooks_path = hooks_file(target, client);
-    let before = read_json(&hooks_path)?;
-    let after = with_hooks(before.clone(), client, bin, stop_hook);
-    if write_json(&hooks_path, &before, &after)? {
-        done.push(format!("hooks → {}", hooks_path.display()));
-    }
-    match client {
-        Client::Claude => {
-            claude_mcp(target, Some(bin))?;
-            done.push("MCP server → Claude Code local scope for this directory".to_string());
+    if let Some(hooks) = &h.hooks {
+        let path = target.join(hooks.file);
+        let before = read_json(&path)?;
+        let after = with_hooks(before.clone(), h, bin, stop_hook);
+        if write_json(&path, &before, &after)? {
+            done.push(format!("hooks → {}", path.display()));
         }
-        Client::Codex => {
-            let path = codex_config(target);
+    }
+    match &h.mcp {
+        Mcp::ClaudeLocal => {
+            claude_mcp(target, Some(bin))?;
+            done.push(format!(
+                "MCP server → {} local scope for this directory",
+                h.name
+            ));
+        }
+        Mcp::TomlBlock { file } => {
+            let path = target.join(file);
             let before = std::fs::read_to_string(&path).unwrap_or_default();
-            let after = with_codex_block(&before, &codex_block(bin))?;
+            let after = with_toml_block(&before, &toml_block(h, bin))?;
             if after != before {
                 write_file(&path, &after)?;
                 done.push(format!("MCP server → {}", path.display()));
@@ -112,28 +90,30 @@ pub fn configure(
     Ok(done)
 }
 
-/// Removes chitchat's configuration for `client` from `target`.
-pub fn unconfigure(target: &Path, client: Client) -> Result<Vec<String>> {
+/// Removes chitchat's configuration for `h` from `target`.
+pub fn unconfigure(target: &Path, h: &Harness) -> Result<Vec<String>> {
     let mut done = Vec::new();
-    let hooks_path = hooks_file(target, client);
-    if hooks_path.exists() {
-        let before = read_json(&hooks_path)?;
-        let after = without_hooks(before.clone(), client);
-        if write_json(&hooks_path, &before, &after)? {
-            done.push(format!("removed hooks from {}", hooks_path.display()));
+    if let Some(hooks) = &h.hooks {
+        let path = target.join(hooks.file);
+        if path.exists() {
+            let before = read_json(&path)?;
+            let after = without_hooks(before.clone(), h);
+            if write_json(&path, &before, &after)? {
+                done.push(format!("removed hooks from {}", path.display()));
+            }
         }
     }
-    match client {
-        Client::Claude => {
+    match &h.mcp {
+        Mcp::ClaudeLocal => {
             if claude_mcp_registered(target) {
                 claude_mcp(target, None)?;
                 done.push("removed the local-scope MCP server".to_string());
             }
         }
-        Client::Codex => {
-            let path = codex_config(target);
+        Mcp::TomlBlock { file } => {
+            let path = target.join(file);
             if let Ok(before) = std::fs::read_to_string(&path) {
-                let after = without_codex_block(&before);
+                let after = without_toml_block(&before);
                 if after != before {
                     write_file(&path, &after)?;
                     done.push(format!("removed the MCP server from {}", path.display()));
@@ -148,25 +128,44 @@ pub fn unconfigure(target: &Path, client: Client) -> Result<Vec<String>> {
 pub struct Status {
     pub mcp: bool,
     pub hooks: usize,
+    /// How many chitchat events this harness supports hooks for.
+    pub hook_events: usize,
 }
 
-pub fn status(target: &Path, client: Client) -> Status {
-    let hooks = read_json(&hooks_file(target, client))
-        .ok()
-        .map_or(0, |v| count_hooks(&v, client));
-    let mcp = match client {
-        Client::Claude => claude_mcp_registered(target),
-        Client::Codex => std::fs::read_to_string(codex_config(target))
+impl Status {
+    pub fn configured(&self) -> bool {
+        self.mcp || self.hooks > 0
+    }
+}
+
+pub fn status(target: &Path, h: &Harness) -> Status {
+    let (hooks, hook_events) = match &h.hooks {
+        Some(spec) => (
+            read_json(&target.join(spec.file))
+                .ok()
+                .map_or(0, |v| count_hooks(&v, h)),
+            spec.events.len(),
+        ),
+        None => (0, 0),
+    };
+    let mcp = match &h.mcp {
+        Mcp::ClaudeLocal => claude_mcp_registered(target),
+        Mcp::TomlBlock { file } => std::fs::read_to_string(target.join(file))
             .is_ok_and(|t| t.lines().any(|l| l.trim() == BLOCK_START)),
     };
-    Status { mcp, hooks }
+    Status {
+        mcp,
+        hooks,
+        hook_events,
+    }
 }
 
 // ---- Claude Code: local-scope MCP server -------------------------------------
 
 /// Adds (with `bin`) or removes (without) the local-scope server for `target`.
 fn claude_mcp(target: &Path, bin: Option<&Path>) -> Result<()> {
-    if !available(Client::Claude) {
+    let h = &crate::harness::CLAUDE;
+    if !h.available() {
         bail!("`claude` is not on PATH");
     }
     let run = |args: &[String]| {
@@ -184,7 +183,7 @@ fn claude_mcp(target: &Path, bin: Option<&Path>) -> Result<()> {
     let mut spec = json!({
         "type": "stdio",
         "command": bin.to_string_lossy(),
-        "args": ["mcp", "--client", "claude"],
+        "args": mcp_args(h),
     });
     let env = passthrough_env();
     if !env.is_empty() {
@@ -222,14 +221,16 @@ fn claude_mcp_registered(target: &Path) -> bool {
     })
 }
 
-// ---- Codex: managed block in .codex/config.toml ------------------------------
+// ---- managed block in a TOML config (Codex) ------------------------------------
 
-fn codex_block(bin: &Path) -> String {
+fn toml_block(h: &Harness, bin: &Path) -> String {
     // TOML basic strings accept JSON string escapes.
     let q = |s: &str| serde_json::to_string(s).unwrap_or_default();
+    let args: Vec<String> = mcp_args(h).iter().map(|a| q(a)).collect();
     let mut block = format!(
-        "{BLOCK_START}\n[mcp_servers.{SERVER_NAME}]\ncommand = {}\nargs = [\"mcp\", \"--client\", \"codex\"]\n",
-        q(&bin.to_string_lossy())
+        "{BLOCK_START}\n[mcp_servers.{SERVER_NAME}]\ncommand = {}\nargs = [{}]\n",
+        q(&bin.to_string_lossy()),
+        args.join(", ")
     );
     let env = passthrough_env();
     if !env.is_empty() {
@@ -242,8 +243,8 @@ fn codex_block(bin: &Path) -> String {
 }
 
 /// Replaces chitchat's block in a config.toml, or appends it.
-pub fn with_codex_block(existing: &str, block: &str) -> Result<String> {
-    let stripped = without_codex_block(existing);
+pub fn with_toml_block(existing: &str, block: &str) -> Result<String> {
+    let stripped = without_toml_block(existing);
     if stripped
         .lines()
         .any(|l| l.trim() == format!("[mcp_servers.{SERVER_NAME}]"))
@@ -261,7 +262,7 @@ pub fn with_codex_block(existing: &str, block: &str) -> Result<String> {
     Ok(out)
 }
 
-pub fn without_codex_block(existing: &str) -> String {
+pub fn without_toml_block(existing: &str) -> String {
     let mut out = Vec::new();
     let mut inside = false;
     for line in existing.lines() {
@@ -293,73 +294,88 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
-fn hook_command(bin: &Path, event: HookEvent, client: Client) -> String {
+pub fn hook_command(bin: &Path, event: HookEvent, h: &Harness) -> String {
     format!(
         "{} hook {} --client {}",
         shell_quote(&bin.to_string_lossy()),
         event.arg(),
-        client_arg(client)
+        h.id
     )
 }
 
-/// Whether a hook handler was written by chitchat for this client.
-fn is_ours(handler: &Value, client: Client) -> bool {
+/// Whether a hook handler was written by chitchat for this harness.
+fn is_ours(handler: &Value, h: &Harness) -> bool {
     handler
         .get("command")
         .and_then(Value::as_str)
         .is_some_and(|c| {
             c.contains("chitchat")
                 && c.contains(" hook ")
-                && c.ends_with(&format!("--client {}", client_arg(client)))
+                && c.ends_with(&format!("--client {}", h.id))
         })
 }
 
-fn count_hooks(settings: &Value, client: Client) -> usize {
-    HookEvent::ALL
+fn count_hooks(settings: &Value, h: &Harness) -> usize {
+    let Some(spec) = &h.hooks else {
+        return 0;
+    };
+    spec.events
         .iter()
-        .filter(|e| {
-            settings["hooks"][event_key(**e)]
+        .filter(|(_, name)| {
+            settings["hooks"][*name]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .flat_map(|g| g["hooks"].as_array().cloned().unwrap_or_default())
-                .any(|h| is_ours(&h, client))
+                .any(|handler| is_ours(&handler, h))
         })
         .count()
 }
 
-/// Returns `settings` with chitchat's hook entries (re)added. Claude Code and Codex
-/// share this shape: `{"hooks": {"<Event>": [{"matcher"?, "hooks": [handler]}]}}`.
-pub fn with_hooks(settings: Value, client: Client, bin: &Path, stop_hook: bool) -> Value {
-    let mut settings = without_hooks(settings, client);
+/// Returns `settings` with chitchat's hook entries (re)added, in the shared
+/// `{"hooks": {"<Event>": [{"matcher"?, "hooks": [handler]}]}}` layout.
+pub fn with_hooks(settings: Value, h: &Harness, bin: &Path, stop_hook: bool) -> Value {
+    let Some(spec) = &h.hooks else {
+        return settings;
+    };
+    let mut settings = without_hooks(settings, h);
     let root = ensure_object(&mut settings);
     let hooks = ensure_object(root.entry("hooks").or_insert_with(|| json!({})));
-    for event in HookEvent::ALL {
+    for &(event, name) in spec.events {
         if event == HookEvent::Stop && !stop_hook {
             continue;
         }
-        let handler = json!({
-            "type": "command",
-            "command": hook_command(bin, event, client),
-            "timeout": HOOK_TIMEOUT,
-        });
-        let mut group = Map::new();
-        // PostToolUse runs after every tool, so urgent messages arrive mid-turn.
-        if event == HookEvent::PostToolUse {
-            group.insert("matcher".into(), json!("*"));
-        }
-        group.insert("hooks".into(), json!([handler]));
-        let list = hooks.entry(event_key(event)).or_insert_with(|| json!([]));
-        if let Some(list) = list.as_array_mut() {
-            list.push(Value::Object(group));
+        if let Some(list) = hooks
+            .entry(name)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+        {
+            list.push(hook_group(spec, event, bin, h));
         }
     }
     settings
 }
 
-/// Returns `settings` with every chitchat hook entry for `client` removed, dropping
+fn hook_group(spec: &Hooks, event: HookEvent, bin: &Path, h: &Harness) -> Value {
+    let handler = json!({
+        "type": "command",
+        "command": hook_command(bin, event, h),
+        "timeout": HOOK_TIMEOUT,
+    });
+    let mut group = Map::new();
+    // After-tool hooks run for every tool, so urgent messages arrive mid-turn.
+    if event == HookEvent::PostToolUse
+        && let Some(matcher) = spec.all_tools_matcher
+    {
+        group.insert("matcher".into(), json!(matcher));
+    }
+    group.insert("hooks".into(), json!([handler]));
+    Value::Object(group)
+}
+
+/// Returns `settings` with every chitchat hook entry for `h` removed, dropping
 /// groups and event lists that become empty.
-pub fn without_hooks(mut settings: Value, client: Client) -> Value {
+pub fn without_hooks(mut settings: Value, h: &Harness) -> Value {
     let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
         return settings;
     };
@@ -369,13 +385,13 @@ pub fn without_hooks(mut settings: Value, client: Client) -> Value {
         };
         for group in groups.iter_mut() {
             if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
-                handlers.retain(|h| !is_ours(h, client));
+                handlers.retain(|handler| !is_ours(handler, h));
             }
         }
         groups.retain(|g| {
             g.get("hooks")
                 .and_then(Value::as_array)
-                .is_none_or(|h| !h.is_empty())
+                .is_none_or(|list| !list.is_empty())
         });
     }
     hooks.retain(|_, groups| groups.as_array().is_none_or(|g| !g.is_empty()));
@@ -385,16 +401,6 @@ pub fn without_hooks(mut settings: Value, client: Client) -> Value {
         root.remove("hooks");
     }
     settings
-}
-
-fn event_key(event: HookEvent) -> String {
-    match event {
-        HookEvent::SessionStart => "SessionStart",
-        HookEvent::UserPromptSubmit => "UserPromptSubmit",
-        HookEvent::PostToolUse => "PostToolUse",
-        HookEvent::Stop => "Stop",
-    }
-    .to_string()
 }
 
 fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {
@@ -436,7 +442,7 @@ fn write_json(path: &Path, before: &Value, after: &Value) -> Result<bool> {
 /// Replaces (or, for empty `text`, removes) a config file. The previous version is
 /// saved under ~/.chitchat/backups/config/ rather than next to it, so nothing new
 /// appears in the user's repository.
-fn write_file(path: &Path, text: &str) -> Result<()> {
+pub fn write_file(path: &Path, text: &str) -> Result<()> {
     if path.exists() {
         let dir = crate::paths::home()?.join("backups").join("config");
         std::fs::create_dir_all(&dir)?;
@@ -504,14 +510,10 @@ fn strings(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
 
-fn on_path(program: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::{CLAUDE, CODEX};
 
     const BIN: &str = "/Users/me/My Tools/chitchat";
 
@@ -524,8 +526,8 @@ mod tests {
                 "PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "lint"}]}]
             }
         });
-        let once = with_hooks(existing.clone(), Client::Claude, Path::new(BIN), true);
-        let twice = with_hooks(once.clone(), Client::Claude, Path::new(BIN), true);
+        let once = with_hooks(existing.clone(), &CLAUDE, Path::new(BIN), true);
+        let twice = with_hooks(once.clone(), &CLAUDE, Path::new(BIN), true);
         assert_eq!(once, twice);
         assert_eq!(once["model"], "opus");
         assert_eq!(once["hooks"]["Stop"].as_array().unwrap().len(), 2);
@@ -534,42 +536,46 @@ mod tests {
             "'/Users/me/My Tools/chitchat' hook user-prompt-submit --client claude"
         );
         assert_eq!(once["hooks"]["PostToolUse"][1]["matcher"], "*");
-        assert_eq!(count_hooks(&once, Client::Claude), 4);
+        assert_eq!(count_hooks(&once, &CLAUDE), 4);
         // Keys keep their original order (serde_json preserve_order).
         let keys: Vec<&String> = once.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["model", "hooks"]);
 
-        assert_eq!(without_hooks(once, Client::Claude), existing);
+        assert_eq!(without_hooks(once, &CLAUDE), existing);
     }
 
     #[test]
-    fn clients_do_not_touch_each_others_entries() {
+    fn harnesses_do_not_touch_each_others_entries() {
         let both = with_hooks(
-            with_hooks(json!({}), Client::Claude, Path::new(BIN), true),
-            Client::Codex,
+            with_hooks(json!({}), &CLAUDE, Path::new(BIN), true),
+            &CODEX,
             Path::new(BIN),
             false,
         );
-        let codex_only = without_hooks(both, Client::Claude);
+        let codex_only = without_hooks(both, &CLAUDE);
         let text = codex_only.to_string();
         assert!(text.contains("--client codex") && !text.contains("--client claude"));
         assert!(codex_only["hooks"].get("Stop").is_none());
-        assert_eq!(without_hooks(codex_only, Client::Codex), json!({}));
+        assert_eq!(without_hooks(codex_only, &CODEX), json!({}));
     }
 
     #[test]
-    fn codex_block_replaces_and_removes_cleanly() {
+    fn toml_block_replaces_and_removes_cleanly() {
         let user = "model = \"gpt-6\"\n\n[mcp_servers.other]\ncommand = \"other\"\n";
-        let block = codex_block(Path::new(BIN));
-        let once = with_codex_block(user, &block).unwrap();
-        let twice = with_codex_block(&once, &block).unwrap();
+        let block = toml_block(&CODEX, Path::new(BIN));
+        assert!(
+            block.contains("args = [\"mcp\", \"--client\", \"codex\"]"),
+            "{block}"
+        );
+        let once = with_toml_block(user, &block).unwrap();
+        let twice = with_toml_block(&once, &block).unwrap();
         assert_eq!(once, twice);
         assert!(once.contains("command = \"/Users/me/My Tools/chitchat\""));
-        assert_eq!(without_codex_block(&once), user);
-        assert_eq!(without_codex_block(&block), "");
+        assert_eq!(without_toml_block(&once), user);
+        assert_eq!(without_toml_block(&block), "");
 
         let clash = "[mcp_servers.chitchat]\ncommand = \"x\"\n";
-        assert!(with_codex_block(clash, &block).is_err());
+        assert!(with_toml_block(clash, &block).is_err());
     }
 
     #[test]

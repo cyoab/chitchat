@@ -70,6 +70,7 @@ fn run(cli: Cli) -> Result<()> {
         ),
         Command::Deinit { path, clients } => workspace::deinit(path.as_deref(), &clients),
         Command::Workspaces => workspace::list(),
+        Command::Clients => workspace::list_clients(),
         Command::Backup { out, list } => human::backup(out.as_deref(), list),
         Command::Restore { backup } => human::restore(&backup),
         Command::Doctor => chitchat::doctor::run(),

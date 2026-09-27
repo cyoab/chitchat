@@ -13,6 +13,7 @@ pub mod db;
 pub mod digest;
 pub mod doctor;
 pub mod format;
+pub mod harness;
 pub mod hook;
 pub mod human;
 pub mod import;

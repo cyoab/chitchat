@@ -4,9 +4,9 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::db::now_ms;
+use crate::harness::{self, Identity};
 use crate::procs::{self, ProcInfo};
 use crate::project::Project;
-use crate::session::Vendor;
 
 /// The human's handle in every project.
 pub const HUMAN_HANDLE: &str = "user";
@@ -14,9 +14,17 @@ pub const HUMAN_HANDLE: &str = "user";
 /// Agents without a known client process count as online this long after last contact.
 const ONLINE_WINDOW_MS: i64 = 15 * 60 * 1000;
 
-/// A shared Codex app-server can outlive the sessions it hosted, so a Codex agent
-/// whose process is alive but that hasn't been heard from in this long is offline.
-const CODEX_STALE_MS: i64 = 12 * 60 * 60 * 1000;
+/// A shared process (e.g. Codex's app-server) can outlive the sessions it hosted,
+/// so a session-identified agent that hasn't been heard from in this long is
+/// offline even if its process is alive.
+const SESSION_STALE_MS: i64 = 12 * 60 * 60 * 1000;
+
+pub const HUMAN_VENDOR: &str = "human";
+
+/// How agents of this vendor are identified; unknown vendors default to by-process.
+fn identity_of(vendor: &str) -> Identity {
+    harness::find(vendor).map_or(Identity::Process, |h| h.identity)
+}
 
 const MAX_STATUS_CHARS: usize = 160;
 
@@ -25,7 +33,8 @@ pub struct Agent {
     pub id: i64,
     pub project_id: i64,
     pub handle: String,
-    pub vendor: Vendor,
+    /// Harness id ("claude", "codex", ...) or "human".
+    pub vendor: String,
     pub client_pid: Option<u32>,
     pub client_started_at: Option<i64>,
     pub session_id: Option<String>,
@@ -41,10 +50,17 @@ impl Agent {
     /// activity decides. The human is always present.
     pub fn is_online(&self) -> bool {
         let quiet_for = now_ms() - self.last_seen_at;
-        match (self.vendor, self.client_pid, self.client_started_at) {
-            (Vendor::Human, _, _) => true,
-            (Vendor::Codex, Some(pid), Some(started)) => {
-                quiet_for < CODEX_STALE_MS && procs::is_alive(pid, started)
+        if self.is_human() {
+            return true;
+        }
+        match (
+            identity_of(&self.vendor),
+            self.client_pid,
+            self.client_started_at,
+        ) {
+            // One process may host many sessions, so a live process alone isn't enough.
+            (Identity::Session, Some(pid), Some(started)) => {
+                quiet_for < SESSION_STALE_MS && procs::is_alive(pid, started)
             }
             (_, Some(pid), Some(started)) => procs::is_alive(pid, started),
             _ => quiet_for < ONLINE_WINDOW_MS,
@@ -52,7 +68,7 @@ impl Agent {
     }
 
     pub fn is_human(&self) -> bool {
-        self.vendor == Vendor::Human
+        self.vendor == HUMAN_VENDOR
     }
 
     pub fn at(&self) -> String {
@@ -64,16 +80,11 @@ const COLUMNS: &str = "id, project_id, handle, vendor, client_pid, client_starte
                        cwd, status, created_at, last_seen_at";
 
 fn from_row(row: &Row) -> rusqlite::Result<Agent> {
-    let vendor: String = row.get(3)?;
     Ok(Agent {
         id: row.get(0)?,
         project_id: row.get(1)?,
         handle: row.get(2)?,
-        vendor: match vendor.as_str() {
-            "claude" => Vendor::Claude,
-            "codex" => Vendor::Codex,
-            _ => Vendor::Human,
-        },
+        vendor: row.get(3)?,
         client_pid: row.get(4)?,
         client_started_at: row.get(5)?,
         session_id: row.get(6)?,
@@ -104,7 +115,8 @@ pub fn ensure_project(conn: &Connection, project: &Project) -> Result<i64> {
 /// Everything known about the process calling into chitchat.
 #[derive(Debug, Clone, Copy)]
 pub struct Caller<'a> {
-    pub vendor: Vendor,
+    /// Harness id ("claude", "codex", ...).
+    pub vendor: &'a str,
     pub client: Option<&'a ProcInfo>,
     pub session_id: Option<&'a str>,
     /// Hooks see the client's current session id; an MCP server only knows the one
@@ -115,11 +127,12 @@ pub struct Caller<'a> {
 
 /// Finds or registers the agent behind `caller`.
 ///
-/// Claude Code agents are matched by client process (shared by the MCP server and
-/// hooks, stable across /clear); a resumed session in a new process keeps its old
-/// handle once that process is gone. Codex agents are matched by session id, since
-/// one Codex process can host several sessions. Otherwise: a new agent with the
-/// next free handle.
+/// Harnesses with [`Identity::Process`] (Claude Code, ...) are matched by client
+/// process, which the MCP server and hooks share and which is stable across
+/// /clear; a resumed session in a new process keeps its old handle once that
+/// process is gone. [`Identity::Session`] harnesses (Codex) are matched by session
+/// id, since one process can host several sessions. Otherwise: a new agent with
+/// the next free handle.
 pub fn resolve(conn: &mut Connection, project_id: i64, caller: &Caller) -> Result<Agent> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let now = now_ms();
@@ -135,7 +148,7 @@ pub fn resolve(conn: &mut Connection, project_id: i64, caller: &Caller) -> Resul
                      WHERE project_id = ?1 AND vendor = ?2 AND session_id = ?3
                      ORDER BY last_seen_at DESC LIMIT 1"
                 ),
-                params![project_id, caller.vendor.as_str(), session],
+                params![project_id, caller.vendor, session],
                 from_row,
             )
             .optional()?;
@@ -153,22 +166,18 @@ pub fn resolve(conn: &mut Connection, project_id: i64, caller: &Caller) -> Resul
                        AND client_started_at = ?4
                      ORDER BY last_seen_at DESC LIMIT 1"
                 ),
-                params![
-                    project_id,
-                    caller.vendor.as_str(),
-                    client.pid,
-                    client.started_at
-                ],
+                params![project_id, caller.vendor, client.pid, client.started_at],
                 from_row,
             )
             .optional()?)
     };
-    let found = match caller.vendor {
-        Vendor::Codex if caller.session_id.is_some() => by_session(false)?,
-        _ => match by_client()? {
+    let found = if identity_of(caller.vendor) == Identity::Session && caller.session_id.is_some() {
+        by_session(false)?
+    } else {
+        match by_client()? {
             Some(agent) => Some(agent),
             None => by_session(true)?,
-        },
+        }
     };
 
     let id = if let Some(agent) = found {
@@ -201,7 +210,7 @@ pub fn resolve(conn: &mut Connection, project_id: i64, caller: &Caller) -> Resul
             params![
                 project_id,
                 handle,
-                caller.vendor.as_str(),
+                caller.vendor,
                 caller.client.map(|c| c.pid),
                 caller.client.map(|c| c.started_at),
                 caller.session_id,
@@ -324,8 +333,8 @@ fn validate_handle(handle: &str) -> Result<()> {
 }
 
 /// "claude-1", "claude-2", ...: the lowest number not already used in the project.
-fn next_handle(conn: &Connection, project_id: i64, vendor: Vendor) -> Result<String> {
-    let prefix = format!("{}-", vendor.as_str());
+fn next_handle(conn: &Connection, project_id: i64, vendor: &str) -> Result<String> {
+    let prefix = format!("{vendor}-");
     let mut stmt = conn.prepare("SELECT handle FROM agents WHERE project_id = ?1")?;
     let used: Vec<u32> = stmt
         .query_map([project_id], |r| r.get::<_, String>(0))?
@@ -361,7 +370,7 @@ pub(crate) mod tests {
     }
 
     pub fn caller<'a>(
-        vendor: Vendor,
+        vendor: &'a str,
         client: Option<&'a ProcInfo>,
         session: Option<&'a str>,
     ) -> Caller<'a> {
@@ -392,16 +401,12 @@ pub(crate) mod tests {
             pid,
             &Caller {
                 session_is_current: false,
-                ..caller(Vendor::Claude, Some(&client), Some("s0"))
+                ..caller("claude", Some(&client), Some("s0"))
             },
         )
         .unwrap();
-        let from_hook = resolve(
-            &mut conn,
-            pid,
-            &caller(Vendor::Claude, Some(&client), Some("s1")),
-        )
-        .unwrap();
+        let from_hook =
+            resolve(&mut conn, pid, &caller("claude", Some(&client), Some("s1"))).unwrap();
         assert_eq!(from_mcp.id, from_hook.id);
         assert_eq!(from_hook.handle, "claude-1");
         assert_eq!(from_hook.session_id.as_deref(), Some("s1"));
@@ -412,7 +417,7 @@ pub(crate) mod tests {
             pid,
             &Caller {
                 session_is_current: false,
-                ..caller(Vendor::Claude, Some(&client), Some("s0"))
+                ..caller("claude", Some(&client), Some("s0"))
             },
         )
         .unwrap();
@@ -429,9 +434,9 @@ pub(crate) mod tests {
                 .unwrap()
                 .handle
         };
-        assert_eq!(h(&mut conn, Vendor::Claude, &a), "claude-1");
-        assert_eq!(h(&mut conn, Vendor::Claude, &b), "claude-2");
-        assert_eq!(h(&mut conn, Vendor::Codex, &c), "codex-1");
+        assert_eq!(h(&mut conn, "claude", &a), "claude-1");
+        assert_eq!(h(&mut conn, "claude", &b), "claude-2");
+        assert_eq!(h(&mut conn, "codex", &c), "codex-1");
     }
 
     #[test]
@@ -442,16 +447,11 @@ pub(crate) mod tests {
         let old = resolve(
             &mut conn,
             pid,
-            &caller(Vendor::Codex, Some(&proc(999_999)), Some("s1")),
+            &caller("codex", Some(&proc(999_999)), Some("s1")),
         )
         .unwrap();
         let me = procs::info(std::process::id()).unwrap();
-        let new = resolve(
-            &mut conn,
-            pid,
-            &caller(Vendor::Codex, Some(&me), Some("s1")),
-        )
-        .unwrap();
+        let new = resolve(&mut conn, pid, &caller("codex", Some(&me), Some("s1"))).unwrap();
         assert_eq!(old.id, new.id);
         assert_eq!(new.client_pid, Some(me.pid));
     }
@@ -464,23 +464,18 @@ pub(crate) mod tests {
         let a = resolve(
             &mut conn,
             pid,
-            &caller(Vendor::Codex, Some(&server), Some("thread-a")),
+            &caller("codex", Some(&server), Some("thread-a")),
         )
         .unwrap();
         let b = resolve(
             &mut conn,
             pid,
-            &caller(Vendor::Codex, Some(&server), Some("thread-b")),
+            &caller("codex", Some(&server), Some("thread-b")),
         )
         .unwrap();
         assert_ne!(a.id, b.id);
         // The hook and the MCP server of session A agree on the session id alone.
-        let a_again = resolve(
-            &mut conn,
-            pid,
-            &caller(Vendor::Codex, None, Some("thread-a")),
-        )
-        .unwrap();
+        let a_again = resolve(&mut conn, pid, &caller("codex", None, Some("thread-a"))).unwrap();
         assert_eq!(a.id, a_again.id);
     }
 
@@ -488,13 +483,8 @@ pub(crate) mod tests {
     fn rename_validates_and_reserves_user() {
         let (_dir, mut conn) = db();
         let pid = project(&conn);
-        let a = resolve(
-            &mut conn,
-            pid,
-            &caller(Vendor::Claude, Some(&proc(1)), None),
-        )
-        .unwrap();
-        let b = resolve(&mut conn, pid, &caller(Vendor::Codex, Some(&proc(2)), None)).unwrap();
+        let a = resolve(&mut conn, pid, &caller("claude", Some(&proc(1)), None)).unwrap();
+        let b = resolve(&mut conn, pid, &caller("codex", Some(&proc(2)), None)).unwrap();
         rename(&conn, &a, "@api").unwrap();
         assert_eq!(get(&conn, a.id).unwrap().handle, "api");
         assert!(rename(&conn, &b, "api").is_err());

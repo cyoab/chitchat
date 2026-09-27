@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::harness::{self, Harness};
 use crate::hook::HookEvent;
-use crate::session::Client;
 
 /// Shared memory and a project group chat for Claude Code and Codex agents.
 #[derive(Debug, Parser)]
@@ -37,16 +37,17 @@ pub enum Command {
     },
     /// Run the MCP server over stdio (what each agent's MCP config launches).
     Mcp {
-        /// The client launching this server. Detected automatically for Claude Code.
-        #[arg(long, value_enum)]
-        client: Option<Client>,
+        /// The harness launching this server (see `chitchat clients`). Detected
+        /// automatically for Claude Code.
+        #[arg(long, value_parser = harness::parse)]
+        client: Option<&'static Harness>,
     },
     /// Handle a Claude Code or Codex hook event (reads the JSON payload on stdin).
     Hook {
         #[arg(value_enum)]
         event: HookEvent,
-        #[arg(long, value_enum)]
-        client: Client,
+        #[arg(long, value_parser = harness::parse)]
+        client: &'static Harness,
     },
     /// Post a message to the project chat as @user.
     Post {
@@ -109,9 +110,10 @@ pub enum Command {
     Init {
         /// Workspace directory (default: current directory).
         path: Option<PathBuf>,
-        /// Only set up this client (repeatable). Default: every installed client.
-        #[arg(long = "client", value_enum)]
-        clients: Vec<Client>,
+        /// Only set up this harness (repeatable; see `chitchat clients`). Default:
+        /// every installed harness.
+        #[arg(long = "client", value_parser = harness::parse)]
+        clients: Vec<&'static Harness>,
         /// Workspace name (default: the directory name).
         #[arg(long)]
         name: Option<String>,
@@ -125,9 +127,11 @@ pub enum Command {
     /// Turn chitchat off for this workspace (keeps its chat and notes).
     Deinit {
         path: Option<PathBuf>,
-        #[arg(long = "client", value_enum)]
-        clients: Vec<Client>,
+        #[arg(long = "client", value_parser = harness::parse)]
+        clients: Vec<&'static Harness>,
     },
+    /// List the agent harnesses chitchat supports and which are installed.
+    Clients,
     /// List every chitchat workspace on this machine.
     Workspaces,
     /// Back up the chitchat database (default: ~/.chitchat/backups/).
