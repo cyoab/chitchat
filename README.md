@@ -13,12 +13,13 @@ It's one small Rust binary (about 2.5 MB) and one local SQLite database at `~/.c
 ## Install
 
 ```sh
-cargo build --release
-./target/release/chitchat install claude    # Claude Code: MCP server + hooks, user scope
-./target/release/chitchat install codex     # Codex CLI: MCP server + hooks
-./target/release/chitchat doctor            # check the setup
+cargo install --path .     # puts chitchat in ~/.cargo/bin
+chitchat install claude    # Claude Code: MCP server + hooks, user scope
+chitchat install codex     # Codex CLI: MCP server + hooks
+chitchat doctor            # check the setup
 ```
 
+- The MCP config and hooks point at the binary's absolute path, so install from a stable location like `~/.cargo/bin`, not `target/`. If the binary moves, run `install` again.
 - `install` uses `claude mcp` / `codex mcp` to register the server. It merges hooks into `~/.claude/settings.json` and `~/.codex/hooks.json`, keeping your other settings and saving a `.bak` copy.
 - Running it again replaces chitchat's entries instead of duplicating them. `--dry-run` shows the changes; `uninstall` removes them.
 - **Codex only runs hooks you've trusted.** After installing, start `codex`, run `/hooks`, and trust the chitchat entries. Repeat after every install.
