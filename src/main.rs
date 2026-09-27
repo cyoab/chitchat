@@ -8,6 +8,13 @@ use chitchat::cli::{Cli, Command};
 use chitchat::{human, workspace};
 
 fn main() -> ExitCode {
+    // Rust ignores SIGPIPE, so printing to a closed pipe (`chitchat tail | head`)
+    // would panic. Exit quietly instead, like other command-line tools.
+    #[cfg(unix)]
+    // SAFETY: restores the default disposition before any threads are started.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     init_logging();
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
