@@ -62,8 +62,13 @@ pub fn run() -> Result<()> {
         } else {
             format!("hooks {}/{}", s.hooks, s.hook_events)
         };
+        let skill = match s.skill {
+            Some(true) => "; skill installed",
+            Some(false) => "; skill missing",
+            None => "",
+        };
         println!(
-            "{:<9} MCP server {}; {hooks}{installed}",
+            "{:<9} MCP server {}; {hooks}{skill}{installed}",
             h.id,
             if s.mcp {
                 "configured"

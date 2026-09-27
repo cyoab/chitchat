@@ -498,11 +498,11 @@ fn normalize_tags(tags: &[String]) -> Result<String> {
             continue;
         }
         let valid = tag.len() <= 32
-            && tag
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+            && tag.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.')
+            });
         if !valid {
-            bail!("tags are up to 32 characters: lowercase letters, digits, '-' and '_'");
+            bail!("tags are up to 32 characters: lowercase letters, digits, '-', '_' and '.'");
         }
         if !out.contains(&tag) {
             out.push(tag);
@@ -783,6 +783,15 @@ mod tests {
             body: body.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn tags_may_be_versions() {
+        assert_eq!(
+            normalize_tags(&["v0.2".into(), "#Plan".into()]).unwrap(),
+            "v0.2 plan"
+        );
+        assert!(normalize_tags(&["no spaces".into()]).is_err());
     }
 
     #[test]

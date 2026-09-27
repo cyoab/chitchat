@@ -30,18 +30,63 @@ pub fn binary_path() -> Result<PathBuf> {
     Ok(exe.canonicalize().unwrap_or(exe))
 }
 
+/// The chitchat skill (Agent Skills format), embedded in the binary.
+pub const SKILL: &str = include_str!("../skills/chitchat/SKILL.md");
+/// Present in the installed SKILL.md; a file without it is the user's own.
+const SKILL_MARKER: &str = "<!-- Installed by `chitchat init`";
+
 /// Files `configure` may create inside the workspace directory, relative to it.
-pub fn local_files(h: &Harness) -> Vec<&'static str> {
+pub fn local_files(h: &Harness) -> Vec<String> {
     let mut files = Vec::new();
     if let Some(hooks) = &h.hooks {
-        files.push(hooks.file);
+        files.push(hooks.file.to_string());
     }
     match &h.mcp {
         Mcp::ClaudeLocal => {}
-        Mcp::TomlBlock { file } => files.push(file),
+        Mcp::TomlBlock { file } => files.push(file.to_string()),
+    }
+    if let Some(dir) = h.skills_dir {
+        files.push(format!("{dir}/chitchat/"));
     }
     files.dedup();
     files
+}
+
+fn skill_path(target: &Path, h: &Harness) -> Option<PathBuf> {
+    h.skills_dir
+        .map(|dir| target.join(dir).join("chitchat").join("SKILL.md"))
+}
+
+/// Installs or refreshes the chitchat skill. Returns whether the file changed.
+fn install_skill(path: &Path) -> Result<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(current) if current == SKILL => Ok(false),
+        Ok(current) if !current.contains(SKILL_MARKER) => bail!(
+            "{} exists and wasn't installed by chitchat; leaving it alone",
+            path.display()
+        ),
+        _ => {
+            write_file(path, SKILL)?;
+            Ok(true)
+        }
+    }
+}
+
+/// Removes the chitchat skill if chitchat installed it. Returns whether it did.
+fn remove_skill(path: &Path) -> Result<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(current) if current.contains(SKILL_MARKER) => {
+            std::fs::remove_file(path)?;
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::remove_dir(dir); // only if now empty
+                if let Some(skills) = dir.parent() {
+                    let _ = std::fs::remove_dir(skills);
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Env vars worth passing to the MCP server. Some harnesses (Codex) start MCP
@@ -67,6 +112,13 @@ pub fn configure(target: &Path, h: &Harness, bin: &Path, stop_hook: bool) -> Res
         let after = with_hooks(before.clone(), h, bin, stop_hook);
         if write_json(&path, &before, &after)? {
             done.push(format!("hooks → {}", path.display()));
+        }
+    }
+    if let Some(path) = skill_path(target, h) {
+        match install_skill(&path) {
+            Ok(true) => done.push(format!("skill → {}", path.display())),
+            Ok(false) => {}
+            Err(e) => done.push(format!("skill: {e:#}")),
         }
     }
     match &h.mcp {
@@ -103,6 +155,11 @@ pub fn unconfigure(target: &Path, h: &Harness) -> Result<Vec<String>> {
             }
         }
     }
+    if let Some(path) = skill_path(target, h)
+        && remove_skill(&path)?
+    {
+        done.push(format!("removed the skill {}", path.display()));
+    }
     match &h.mcp {
         Mcp::ClaudeLocal => {
             if claude_mcp_registered(target) {
@@ -130,11 +187,13 @@ pub struct Status {
     pub hooks: usize,
     /// How many chitchat events this harness supports hooks for.
     pub hook_events: usize,
+    /// None when the harness has no skills support.
+    pub skill: Option<bool>,
 }
 
 impl Status {
     pub fn configured(&self) -> bool {
-        self.mcp || self.hooks > 0
+        self.mcp || self.hooks > 0 || self.skill == Some(true)
     }
 }
 
@@ -153,10 +212,13 @@ pub fn status(target: &Path, h: &Harness) -> Status {
         Mcp::TomlBlock { file } => std::fs::read_to_string(target.join(file))
             .is_ok_and(|t| t.lines().any(|l| l.trim() == BLOCK_START)),
     };
+    let skill = skill_path(target, h)
+        .map(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains(SKILL_MARKER)));
     Status {
         mcp,
         hooks,
         hook_events,
+        skill,
     }
 }
 
@@ -576,6 +638,30 @@ mod tests {
 
         let clash = "[mcp_servers.chitchat]\ncommand = \"x\"\n";
         assert!(with_toml_block(clash, &block).is_err());
+    }
+
+    #[test]
+    fn skill_is_installed_refreshed_and_removed_but_never_clobbers_the_users() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude/skills/chitchat/SKILL.md");
+        assert!(SKILL.starts_with("---\nname: chitchat\ndescription: "));
+        assert!(install_skill(&path).unwrap());
+        assert!(!install_skill(&path).unwrap());
+        // An older chitchat version's copy is refreshed.
+        std::fs::write(&path, format!("old text\n{SKILL_MARKER} -->\n")).unwrap();
+        assert!(install_skill(&path).unwrap());
+        assert!(remove_skill(&path).unwrap());
+        assert!(!dir.path().join(".claude/skills").exists());
+
+        // A skill the user wrote under the same name stays.
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "my own chitchat notes").unwrap();
+        assert!(install_skill(&path).is_err());
+        assert!(!remove_skill(&path).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "my own chitchat notes"
+        );
     }
 
     #[test]

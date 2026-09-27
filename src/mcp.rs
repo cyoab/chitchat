@@ -15,6 +15,7 @@ use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use rusqlite::Connection;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::agents::{self, Agent, Caller};
 use crate::chat::{self, Intent, NewMessage};
@@ -667,8 +668,8 @@ impl ChitchatServer {
     }
 }
 
-/// Runs the server on stdin/stdout until the client disconnects.
-pub fn run(client: Option<&'static Harness>) -> Result<()> {
+/// Sets up the server for whichever harness launched us (or `client`).
+fn setup(client: Option<&'static Harness>) -> Result<ChitchatServer> {
     let session = SessionHint::from_env();
     let client_proc = procs::client_process(None);
     let harness = client
@@ -691,16 +692,23 @@ pub fn run(client: Option<&'static Harness>) -> Result<()> {
         }
         None => None,
     };
-    tracing::info!(project = ?ws.as_ref().map(|w| &w.project.key), harness = harness.id, client = ?client_proc, "starting MCP server");
-    match crate::backup::auto(&db) {
-        Ok(Some(path)) => tracing::info!("daily backup written to {}", path.display()),
-        Ok(None) => {}
-        Err(e) => tracing::warn!("daily backup failed: {e:#}"),
-    }
+    tracing::info!(project = ?ws.as_ref().map(|w| &w.project.key), harness = harness.id, client = ?client_proc, "chitchat server");
+    Ok(ChitchatServer::new(db, ws, harness, client_proc, session))
+}
 
+/// Runs the server on stdin/stdout until the client disconnects.
+pub fn run(client: Option<&'static Harness>) -> Result<()> {
+    let server = setup(client)?;
+    {
+        let db = server.db.lock().unwrap_or_else(|e| e.into_inner());
+        match crate::backup::auto(&db) {
+            Ok(Some(path)) => tracing::info!("daily backup written to {}", path.display()),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("daily backup failed: {e:#}"),
+        }
+    }
     crate::update::spawn_auto_check();
 
-    let server = ChitchatServer::new(db, ws, harness, client_proc, session);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -710,4 +718,102 @@ pub fn run(client: Option<&'static Harness>) -> Result<()> {
         service.waiting().await?;
         anyhow::Ok(())
     })
+}
+
+/// `chitchat tool`: one tool call from a shell, for harnesses without MCP. The
+/// agent is identified by its client process, like hooks.
+pub fn run_tool(
+    client: Option<&'static Harness>,
+    name: Option<&str>,
+    args: Option<&str>,
+    list: bool,
+) -> Result<()> {
+    let server = setup(client)?;
+    let Some(name) = name.filter(|_| !list) else {
+        println!("{}", server.describe_tools());
+        return Ok(());
+    };
+    let args: Value = match args.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(text) => serde_json::from_str(text).context("arguments must be a JSON object")?,
+        None => Value::Object(Default::default()),
+    };
+    match server.call_json(name, args) {
+        Ok(text) => {
+            println!("{text}");
+            Ok(())
+        }
+        Err(text) => anyhow::bail!("{text}"),
+    }
+}
+
+impl ChitchatServer {
+    /// Calls a tool by name with JSON arguments, exactly as over MCP.
+    pub fn call_json(&self, name: &str, args: Value) -> ToolResult {
+        fn params<T: serde::de::DeserializeOwned>(args: Value) -> Result<Parameters<T>, String> {
+            serde_json::from_value(args)
+                .map(Parameters)
+                .map_err(|e| format!("invalid arguments: {e}"))
+        }
+        let meta = RequestMetaObject::default();
+        match name {
+            "join" => self.join(meta, params(args)?),
+            "who" => self.who(meta),
+            "post" => self.post(meta, params(args)?),
+            "inbox" => self.inbox(meta, params(args)?),
+            "ack" => self.ack(meta, params(args)?),
+            "remember" => self.remember(meta, params(args)?),
+            "recall" => self.recall(meta, params(args)?),
+            "get" => self.get(meta, params(args)?),
+            "claim" => self.claim(meta, params(args)?),
+            "release" => self.release(meta, params(args)?),
+            _ => Err(format!(
+                "unknown tool `{name}`; `chitchat tool --list` shows them"
+            )),
+        }
+    }
+
+    /// Every tool with its description and arguments, for `chitchat tool --list`.
+    pub fn describe_tools(&self) -> String {
+        let mut out = String::from(
+            "Usage: chitchat tool <name> '<json arguments>' --client <id>\n\nTools:\n",
+        );
+        let mut tools = self.tool_router.list_all();
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        for tool in tools {
+            let description = tool
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .replace('\n', " ");
+            out.push_str(&format!("\n{}: {description}\n", tool.name));
+            let required: Vec<&str> = tool
+                .input_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            if let Some(props) = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+            {
+                for (arg, schema) in props {
+                    let doc = schema
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .replace('\n', " ");
+                    let req = if required.contains(&arg.as_str()) {
+                        " (required)"
+                    } else {
+                        ""
+                    };
+                    out.push_str(&format!("  {arg}{req}: {doc}\n"));
+                }
+            }
+        }
+        out.trim_end().to_string()
+    }
 }

@@ -49,6 +49,20 @@ pub enum Command {
         #[arg(long, value_parser = harness::parse)]
         client: &'static Harness,
     },
+    /// Run one chitchat tool from a shell, as an agent. For harnesses without MCP
+    /// support; `chitchat tool --list` shows the tools.
+    Tool {
+        /// Tool name: post, inbox, who, remember, recall, ...
+        name: Option<String>,
+        /// Arguments as a JSON object, e.g. '{"body": "tests pass", "to": "@codex-1"}'.
+        args: Option<String>,
+        /// The harness you're running in (see `chitchat clients`).
+        #[arg(long, value_parser = harness::parse)]
+        client: Option<&'static Harness>,
+        /// List the tools and their arguments.
+        #[arg(long)]
+        list: bool,
+    },
     /// Post a message to the project chat as @user.
     Post {
         message: String,

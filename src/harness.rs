@@ -24,6 +24,9 @@ pub struct Harness {
     pub mcp_session_env: Option<&'static str>,
     pub mcp: Mcp,
     pub hooks: Option<Hooks>,
+    /// Directory (relative to the workspace) the harness loads Agent Skills from;
+    /// `chitchat init` installs the chitchat skill there.
+    pub skills_dir: Option<&'static str>,
     /// What the user still has to do after `chitchat init`, if anything.
     pub setup_note: Option<&'static str>,
 }
@@ -102,6 +105,7 @@ pub static CLAUDE: Harness = Harness {
         all_tools_matcher: Some("*"),
         output: Output::Claude,
     }),
+    skills_dir: Some(".claude/skills"),
     setup_note: None,
 };
 
@@ -121,6 +125,7 @@ pub static CODEX: Harness = Harness {
         all_tools_matcher: Some("*"),
         output: Output::Codex,
     }),
+    skills_dir: Some(".agents/skills"),
     setup_note: Some(
         "trust this folder when Codex asks, then run /hooks and trust the chitchat hooks.",
     ),

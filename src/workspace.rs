@@ -103,11 +103,14 @@ pub fn init(path: Option<&Path>, opts: &InitOptions) -> Result<()> {
 
     let mut excluded = Vec::new();
     for target in &targets {
-        let mut files: Vec<&str> = clients
+        let mut owned: Vec<String> = clients
             .iter()
             .flat_map(|c| clients::local_files(c))
             .collect();
-        files.push(".chitchat/");
+        owned.push(".chitchat/".to_string());
+        owned.sort();
+        owned.dedup();
+        let files: Vec<&str> = owned.iter().map(String::as_str).collect();
         excluded.extend(clients::exclude_from_git(target, &files)?);
     }
     if !excluded.is_empty() {
