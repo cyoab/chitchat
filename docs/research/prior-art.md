@@ -215,7 +215,7 @@ The earlier probe server (with axum, sqlite-vec and rust-embed) measured **2.5â€
 | MCP | `rmcp` 3.4.1, features `server`, `macros`, `schemars`, `transport-io` | stdio only in v1 |
 | Runtime | `tokio` 1.53 | required by rmcp |
 | SQLite driver | **`rusqlite` 0.40, `bundled`** | Mature, the de-facto choice. Ships SQLite 3.53.2 with FTS5, JSON1 and extension loading compiled in, so there's nothing to install. Synchronous; call it through `spawn_blocking` (or `tokio-rusqlite`). |
-| Migrations | `rusqlite_migration` 2.6 | Uses `user_version` |
+| Migrations | Our own ~30-line migrator in `src/db.rs` (`user_version`) | We don't use `rusqlite_migration` 2.6: it reads the version *before* opening its transaction, so two agents starting at once both apply migration 1 and one fails. Our migrator re-reads the version under `BEGIN IMMEDIATE`. A lock on a sidecar file also serializes the first WAL switch, which otherwise fails with "database is locked" under contention. |
 | Search | FTS5 BM25 (unicode61 + porter), plus a trigram index for identifiers and paths | No embeddings in v1 |
 | Later, behind cargo features | `sqlite-vec` 0.1.9 (~70 KB); `model2vec-rs` / `fastembed` | Fuse with reciprocal rank fusion |
 | CLI / logs | `clap` 4.6, `tracing` | |
