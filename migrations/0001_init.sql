@@ -14,22 +14,35 @@ CREATE TABLE projects (
     updated_at INTEGER NOT NULL
 ) STRICT;
 
--- One row per participant in a project: an agent session, or the human.
+-- One row per participant in a project: an agent, or the human ("user").
+--
+-- Identity differs by client:
+-- - Claude Code: one agent = one `claude` process. Its MCP server and hooks are
+--   both children of it, so the client's pid + start time ties them together and
+--   survives /clear and compaction (which change the session id).
+-- - Codex: one agent = one session. A shared `codex app-server` may host many
+--   sessions, but hooks get `session_id` and every MCP call carries the same id
+--   as `_meta.sessionId`. The client pid is kept only for presence.
 CREATE TABLE agents (
-    id           INTEGER PRIMARY KEY,
-    project_id   INTEGER NOT NULL REFERENCES projects (id),
-    handle       TEXT NOT NULL,       -- "claude-1", "codex-2", "you"
-    vendor       TEXT NOT NULL CHECK (vendor IN ('claude', 'codex', 'human')),
-    session_id   TEXT,                -- the client's own session / thread id
-    cwd          TEXT,
-    status       TEXT,                -- short "working on ..." line shown to other agents
-    created_at   INTEGER NOT NULL,
-    last_seen_at INTEGER NOT NULL,
+    id                INTEGER PRIMARY KEY,
+    project_id        INTEGER NOT NULL REFERENCES projects (id),
+    handle            TEXT NOT NULL,  -- "claude-1", "codex-2", "user"
+    vendor            TEXT NOT NULL CHECK (vendor IN ('claude', 'codex', 'human')),
+    client_pid        INTEGER,        -- the Claude Code / Codex process
+    client_started_at INTEGER,        -- its start time, to survive pid reuse
+    session_id        TEXT,           -- the client's current session / thread id
+    cwd               TEXT,
+    status            TEXT,           -- short "working on ..." line shown to other agents
+    created_at        INTEGER NOT NULL,
+    last_seen_at      INTEGER NOT NULL,
     UNIQUE (project_id, handle)
 ) STRICT;
 
-CREATE UNIQUE INDEX agents_by_session
-    ON agents (project_id, vendor, session_id)
+CREATE INDEX agents_by_client
+    ON agents (project_id, client_pid, client_started_at)
+    WHERE client_pid IS NOT NULL;
+
+CREATE INDEX agents_by_session ON agents (project_id, vendor, session_id)
     WHERE session_id IS NOT NULL;
 
 -- A message goes either to a room or directly to one agent.
@@ -40,6 +53,7 @@ CREATE TABLE messages (
     room         TEXT,                               -- NULL for a direct message
     recipient_id INTEGER REFERENCES agents (id),     -- set only for a direct message
     thread_id    INTEGER REFERENCES messages (id),   -- root message of the thread
+    reply_to     INTEGER REFERENCES messages (id),   -- the message this one answers
     intent       TEXT NOT NULL CHECK (intent IN ('request', 'inform', 'ack')),
     body         TEXT NOT NULL,
     created_at   INTEGER NOT NULL,
@@ -56,7 +70,8 @@ CREATE TABLE receipts (
     agent_id     INTEGER NOT NULL REFERENCES agents (id),
     mentioned    INTEGER NOT NULL DEFAULT 0 CHECK (mentioned IN (0, 1)),  -- @mention or DM
     delivered_at INTEGER,             -- first shown to the agent (hook or inbox)
-    acked_at     INTEGER,             -- marked handled by the agent
+    acked_at     INTEGER,             -- request answered or dismissed by the agent
+    nudged_at    INTEGER,             -- Stop hook already asked the agent to answer it
     PRIMARY KEY (message_id, agent_id)
 ) STRICT, WITHOUT ROWID;
 
@@ -139,6 +154,39 @@ END;
 
 CREATE TRIGGER messages_fts_on_delete AFTER DELETE ON messages BEGIN
     INSERT INTO messages_fts (messages_fts, rowid, body) VALUES ('delete', old.id, old.body);
+END;
+
+-- Read-only index of the project's own Markdown docs (README, docs/, ...), so
+-- `recall` finds them next to notes. Rebuilt from the working tree; never edited.
+CREATE TABLE docs (
+    id         INTEGER PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES projects (id),
+    path       TEXT NOT NULL,         -- relative to the worktree root
+    title      TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    mtime_ms   INTEGER NOT NULL,
+    size       INTEGER NOT NULL,
+    indexed_at INTEGER NOT NULL,
+    UNIQUE (project_id, path)
+) STRICT;
+
+CREATE VIRTUAL TABLE docs_fts USING fts5 (
+    title, body,
+    content = 'docs', content_rowid = 'id',
+    tokenize = 'porter unicode61'
+);
+
+CREATE TRIGGER docs_fts_on_insert AFTER INSERT ON docs BEGIN
+    INSERT INTO docs_fts (rowid, title, body) VALUES (new.id, new.title, new.body);
+END;
+
+CREATE TRIGGER docs_fts_on_delete AFTER DELETE ON docs BEGIN
+    INSERT INTO docs_fts (docs_fts, rowid, title, body) VALUES ('delete', old.id, old.title, old.body);
+END;
+
+CREATE TRIGGER docs_fts_on_update AFTER UPDATE OF title, body ON docs BEGIN
+    INSERT INTO docs_fts (docs_fts, rowid, title, body) VALUES ('delete', old.id, old.title, old.body);
+    INSERT INTO docs_fts (rowid, title, body) VALUES (new.id, new.title, new.body);
 END;
 
 -- Claims on files or tasks. Exclusivity is enforced by writers inside a

@@ -62,3 +62,15 @@ impl SessionHint {
         }
     }
 }
+
+/// Best-effort vendor from the client process name ("claude", "codex", ...).
+pub fn vendor_from_process(name: &str) -> Option<Vendor> {
+    let name = name.to_ascii_lowercase();
+    if name.contains("claude") {
+        Some(Vendor::Claude)
+    } else if name.contains("codex") {
+        Some(Vendor::Codex)
+    } else {
+        None
+    }
+}

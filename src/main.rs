@@ -1,10 +1,11 @@
 use std::process::ExitCode;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::Parser;
 use tracing::level_filters::LevelFilter;
 
 use chitchat::cli::{Cli, Command};
+use chitchat::{human, install};
 
 fn main() -> ExitCode {
     init_logging();
@@ -24,15 +25,36 @@ fn run(cli: Cli) -> Result<()> {
             chitchat::hook::run(event, client);
             Ok(())
         }
+        Command::Post {
+            message,
+            to,
+            room,
+            request,
+            reply_to,
+        } => human::post(&message, to, room, request, reply_to),
+        Command::Tail {
+            room,
+            lines,
+            no_follow,
+        } => human::tail(room.as_deref(), lines, !no_follow),
+        Command::Who => human::who(),
+        Command::Notes {
+            query,
+            kind,
+            messages,
+            limit,
+        } => human::notes(&query.join(" "), kind.as_deref(), messages, limit),
+        Command::Note { key, history } => human::note(&key, history),
+        Command::Forget { key } => human::forget(&key),
+        Command::Export { dir } => human::export(dir),
+        Command::Install {
+            client,
+            dry_run,
+            no_stop_hook,
+        } => install::install(client, dry_run, !no_stop_hook),
+        Command::Uninstall { client, dry_run } => install::uninstall(client, dry_run),
         Command::Doctor => chitchat::doctor::run(),
-        Command::Post { .. } => not_yet("post"),
-        Command::Tail { .. } => not_yet("tail"),
-        Command::Install { .. } => not_yet("install"),
     }
-}
-
-fn not_yet(command: &str) -> Result<()> {
-    bail!("`chitchat {command}` is not implemented yet")
 }
 
 /// Logs go to stderr: stdout is reserved for MCP JSON-RPC and hook output.

@@ -174,7 +174,12 @@ The `wait` long-poll tool is cut from v1. It's easy to add later by polling `PRA
 - **One global DB, not one per repo.** Projects are keyed by git remote (or git common dir), so agents working in different **git worktrees** of the same repo share one room and one memory.
 - **Web UI:** later, as a separate `chitchat ui` process reading the same DB.
 
-**Identity**
+**Identity** (as implemented; see `src/agents.rs`)
+
+- **Claude Code:** an agent is one `claude` process. The MCP server's parent and the hooks' `CLAUDE_PID` both name it, and it survives `/clear`. A resumed session in a new process keeps its handle.
+- **Codex:** an agent is one session. One `codex app-server` can host several sessions, so the process is kept only for presence. Hooks get `session_id`, and every MCP call carries the same value as `_meta.sessionId`. Both were verified with Codex 0.157.1.
+
+Original plan, for reference:
 
 | Client | Source | Status |
 |---|---|---|

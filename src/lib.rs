@@ -3,11 +3,20 @@
 //! `chitchat hook`; all of them share one SQLite database. See
 //! `docs/research/prior-art.md` for the design.
 
+pub mod agents;
+pub mod chat;
+pub mod claims;
 pub mod cli;
 pub mod db;
+pub mod digest;
 pub mod doctor;
+pub mod format;
 pub mod hook;
+pub mod human;
+pub mod install;
 pub mod mcp;
+pub mod memory;
 pub mod paths;
+pub mod procs;
 pub mod project;
 pub mod session;

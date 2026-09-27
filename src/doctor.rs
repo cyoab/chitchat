@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::session::SessionHint;
+use crate::session::{Client, SessionHint};
 
 pub fn run() -> Result<()> {
     let db_path = crate::paths::db_path()?;
@@ -29,5 +29,30 @@ pub fn run() -> Result<()> {
         (Some(vendor), None) => println!("session   {} (no session id)", vendor.as_str()),
         _ => println!("session   none detected (not running inside an agent)"),
     }
+    for client in [Client::Claude, Client::Codex] {
+        let label = if client == Client::Claude {
+            "claude"
+        } else {
+            "codex "
+        };
+        match crate::install::status(client) {
+            Ok(s) => {
+                let mcp = if s.mcp_registered {
+                    "registered"
+                } else {
+                    "not registered"
+                };
+                let total = crate::hook::HookEvent::ALL.len();
+                println!(
+                    "{label}    MCP server {mcp} ({}); hooks {}/{total} ({})",
+                    s.mcp_config.display(),
+                    s.hooks_installed,
+                    s.hooks_file.display()
+                );
+            }
+            Err(e) => println!("{label}    could not check: {e:#}"),
+        }
+    }
+    println!("install   chitchat install claude | chitchat install codex");
     Ok(())
 }

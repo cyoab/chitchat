@@ -15,19 +15,30 @@ chitchat is a Rust CLI and stdio MCP server. It gives Claude Code and Codex sess
 |---|---|
 | `src/main.rs` | Process entry: logging and subcommand dispatch |
 | `src/cli.rs` | clap definitions for every subcommand |
-| `src/mcp.rs` | `chitchat mcp`, the stdio MCP server (rmcp) |
-| `src/hook.rs` | `chitchat hook <event>`, the Claude Code and Codex hook handler |
+| `src/mcp.rs` | `chitchat mcp`: the stdio MCP server and its 10 tools (rmcp) |
+| `src/hook.rs` | `chitchat hook <event>`: what Claude Code / Codex hooks run; exact per-client output |
+| `src/install.rs` | `chitchat install/uninstall`: MCP registration and hook-file merging |
+| `src/human.rs` | Commands for the human: `post`, `tail`, `who`, `notes`, `note`, `forget`, `export` |
+| `src/agents.rs` | Participants: identity resolution (Claude by process, Codex by session), presence |
+| `src/chat.rs` | Messages, receipts (fan-out on write), inbox, acks, hook delivery |
+| `src/memory.rs` | Notes (versioned, optimistic concurrency), docs index, FTS recall, Markdown export |
+| `src/claims.rs` | File/dir/task leases with TTL and overlap rules |
+| `src/digest.rs` | Text shown to agents: who-lists, digests, footers |
+| `src/procs.rs` | Process ancestry (macOS `proc_pidinfo`, Linux `/proc`) |
 | `src/db.rs` | Connection setup (WAL, busy timeout, setup lock) and the migrator |
 | `src/project.rs` | Project identity from the git remote or main worktree |
 | `src/session.rs` | Client and vendor types; session detection from the environment |
-| `src/paths.rs` | Data directory resolution (`CHITCHAT_HOME`) |
+| `src/format.rs`, `src/paths.rs` | Time/text helpers; data directory (`CHITCHAT_HOME`) |
+| `src/doctor.rs` | `chitchat doctor` |
 | `migrations/` | SQL migrations, applied in order |
-| `tests/cli.rs` | End-to-end tests against the built binary |
+| `tests/cli.rs` | End-to-end tests: real MCP servers and hooks, two fake agents |
 
 ## Rules
 
 - **stdout is protocol.** In `chitchat mcp` it carries JSON-RPC. In `chitchat hook` it is injected into the agent's context. Never `println!` on those paths; log with `tracing`, which goes to stderr.
 - **Hooks never fail the agent.** `chitchat hook` always exits 0 and prints nothing unless it has something for the agent.
+- **Hook output is exact per client.** Codex rejects unknown fields (`deny_unknown_fields`) and accepts only `decision`/`reason` on Stop. Check `hook::render` and its tests before changing any output.
+- **Other agents' text is untrusted.** Anything shown to an agent from chat or notes is labeled as information, not instructions.
 - **Many processes share the database.**
   - Keep transactions short.
   - Use `TransactionBehavior::Immediate` for any read-then-write.
