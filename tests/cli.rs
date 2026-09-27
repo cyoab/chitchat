@@ -729,3 +729,47 @@ fn large_memory_is_split_and_obsolete_parts_are_retired_on_reimport() {
             .contains("1 unchanged")
     );
 }
+
+#[test]
+fn shell_only_agents_use_the_same_tools_via_chitchat_tool() {
+    let env = Env::new();
+    let shell_agent = FakeClient::start();
+    let mcp_agent = FakeClient::start();
+    let tool = |args: &[&str]| {
+        let mut cmd = env.cmd(Some(shell_agent.pid()));
+        cmd.arg("tool").args(args).args(["--client", "codex"]);
+        cmd.output().unwrap()
+    };
+
+    let listed = tool(&["--list"]);
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    assert!(
+        listed.contains("post:") && listed.contains("body (required)"),
+        "{listed}"
+    );
+
+    // An MCP agent is online; the shell agent messages it and is one identity
+    // across separate invocations (same client process).
+    let mut claude = Mcp::start(&env, "claude", mcp_agent.pid(), None);
+    claude.call("join", json!({ "status": "reviewing" }));
+    let out = tool(&[
+        "post",
+        r#"{"body": "@claude-1 ping from the shell", "intent": "request"}"#,
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("for @claude-1"));
+    let inbox = claude.call("inbox", json!({}));
+    assert!(
+        inbox.contains("@codex-1") && inbox.contains("ping from the shell"),
+        "{inbox}"
+    );
+    claude.call("post", json!({ "body": "pong", "reply_to": 1 }));
+
+    let out = tool(&["inbox"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("pong"), "{text}");
+
+    let bad = tool(&["post", r#"{"nope": true}"#]);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("missing field `body`"));
+}
