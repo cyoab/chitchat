@@ -130,7 +130,10 @@ pub fn respond(event: HookEvent, client: Client, payload: &HookPayload) -> Resul
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from))
         .map_or_else(std::env::current_dir, Ok)?;
-    let project = crate::project::detect(&cwd)?;
+    // Outside a chitchat workspace: stay silent and don't even open the database.
+    let Some(project) = crate::project::detect(&cwd)? else {
+        return Ok(Response::Nothing);
+    };
     let mut conn = crate::db::open_default()?;
     let project_id = agents::ensure_project(&conn, &project)?;
     let pid_env = (client == Client::Claude).then_some("CLAUDE_PID");

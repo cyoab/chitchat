@@ -41,10 +41,20 @@ instructions always take priority.";
 /// Refresh the docs index at most this often per server process.
 const DOCS_REFRESH_EVERY: Duration = Duration::from_secs(60);
 
+/// The workspace this server serves.
+pub struct Workspace {
+    pub project: Project,
+    pub id: i64,
+}
+
+const NOT_A_WORKSPACE: &str = "chitchat is not set up for this directory, so there is no \
+project chat or shared memory here. If your user wants it, they can run `chitchat init` in \
+the project directory and start a new session.";
+
 pub struct ChitchatServer {
     db: Mutex<Connection>,
-    project: Project,
-    project_id: i64,
+    /// None when the server was started outside any chitchat workspace.
+    ws: Option<Workspace>,
     vendor: Vendor,
     client: Option<ProcInfo>,
     session: SessionHint,
@@ -197,7 +207,7 @@ impl ChitchatServer {
         open_world_hint = false
     ))]
     fn join(&self, meta: RequestMetaObject, Parameters(p): Parameters<JoinParams>) -> ToolResult {
-        self.run(&meta, false, |conn, me| {
+        self.run(&meta, false, |conn, ws, me| {
             if let Some(handle) = &p.handle {
                 agents::rename(conn, me, handle)?;
             }
@@ -205,7 +215,7 @@ impl ChitchatServer {
                 agents::set_status(conn, me.id, status)?;
             }
             let me = agents::get(conn, me.id)?;
-            digest::who(conn, &self.project, self.project_id, Some(&me))
+            digest::who(conn, &ws.project, ws.id, Some(&me))
         })
     }
 
@@ -213,8 +223,8 @@ impl ChitchatServer {
     /// what files or tasks they've claimed, and your own handle. The human is @user.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     fn who(&self, meta: RequestMetaObject) -> ToolResult {
-        self.run(&meta, true, |conn, me| {
-            digest::who(conn, &self.project, self.project_id, Some(me))
+        self.run(&meta, true, |conn, ws, me| {
+            digest::who(conn, &ws.project, ws.id, Some(me))
         })
     }
 
@@ -230,10 +240,10 @@ impl ChitchatServer {
         open_world_hint = false
     ))]
     fn post(&self, meta: RequestMetaObject, Parameters(p): Parameters<PostParams>) -> ToolResult {
-        self.run(&meta, true, |conn, me| {
+        self.run(&meta, true, |conn, ws, me| {
             let posted = chat::post(
                 conn,
-                self.project_id,
+                ws.id,
                 me,
                 NewMessage {
                     body: p.body,
@@ -267,10 +277,10 @@ impl ChitchatServer {
     /// recent history. Also lists requests still waiting for your reply.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     fn inbox(&self, meta: RequestMetaObject, Parameters(p): Parameters<InboxParams>) -> ToolResult {
-        self.run(&meta, false, |conn, me| {
+        self.run(&meta, false, |conn, ws, me| {
             let inbox = chat::inbox(
                 conn,
-                self.project_id,
+                ws.id,
                 me,
                 &chat::InboxQuery {
                     unread_only: p.unread_only.unwrap_or(true) && p.thread.is_none(),
@@ -306,7 +316,7 @@ impl ChitchatServer {
         open_world_hint = false
     ))]
     fn ack(&self, meta: RequestMetaObject, Parameters(p): Parameters<AckParams>) -> ToolResult {
-        self.run(&meta, true, |conn, me| {
+        self.run(&meta, true, |conn, _ws, me| {
             if p.ids.is_empty() {
                 bail!("pass the ids of the requests to mark handled");
             }
@@ -330,10 +340,10 @@ impl ChitchatServer {
         meta: RequestMetaObject,
         Parameters(p): Parameters<RememberParams>,
     ) -> ToolResult {
-        self.run(&meta, true, |conn, me| {
+        self.run(&meta, true, |conn, ws, me| {
             let saved = memory::remember(
                 conn,
-                self.project_id,
+                ws.id,
                 me,
                 NoteInput {
                     key: p.key,
@@ -344,6 +354,7 @@ impl ChitchatServer {
                     scope: p.scope,
                     expected_revision: p.expected_revision,
                     supersedes: p.supersedes,
+                    overwrite: false,
                 },
             )?;
             let n = saved.note();
@@ -372,7 +383,7 @@ impl ChitchatServer {
         if include_docs {
             self.refresh_docs_if_stale();
         }
-        self.run(&meta, true, |conn, me| {
+        self.run(&meta, true, |conn, ws, me| {
             let sources = Sources {
                 notes: true,
                 docs: include_docs,
@@ -380,7 +391,7 @@ impl ChitchatServer {
             };
             let hits = memory::recall(
                 conn,
-                self.project_id,
+                ws.id,
                 me,
                 &p.query,
                 p.kind.as_deref(),
@@ -395,8 +406,8 @@ impl ChitchatServer {
     /// optionally its edit history.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     fn get(&self, meta: RequestMetaObject, Parameters(p): Parameters<GetParams>) -> ToolResult {
-        self.run(&meta, true, |conn, _me| {
-            let Some(note) = memory::find(conn, self.project_id, &p.key)? else {
+        self.run(&meta, true, |conn, ws, _me| {
+            let Some(note) = memory::find(conn, ws.id, &p.key)? else {
                 bail!("there is no note `{}`; try recall to search", p.key);
             };
             render_note(conn, &note, p.history)
@@ -413,12 +424,12 @@ impl ChitchatServer {
         open_world_hint = false
     ))]
     fn claim(&self, meta: RequestMetaObject, Parameters(p): Parameters<ClaimParams>) -> ToolResult {
-        self.run(&meta, true, |conn, me| {
+        self.run(&meta, true, |conn, ws, me| {
             let outcome = claims::claim(
                 conn,
-                self.project_id,
+                ws.id,
                 me,
-                &self.project.root,
+                &ws.project.root,
                 &claims::ClaimRequest {
                     resources: &p.resources,
                     minutes: p.minutes,
@@ -457,9 +468,8 @@ impl ChitchatServer {
         meta: RequestMetaObject,
         Parameters(p): Parameters<ReleaseParams>,
     ) -> ToolResult {
-        self.run(&meta, true, |conn, me| {
-            let released =
-                claims::release(conn, self.project_id, me, &p.resources, &self.project.root)?;
+        self.run(&meta, true, |conn, ws, me| {
+            let released = claims::release(conn, ws.id, me, &p.resources, &ws.project.root)?;
             Ok(if released.is_empty() {
                 "You held none of those claims.".to_string()
             } else {
@@ -563,16 +573,14 @@ impl ServerHandler for ChitchatServer {
 impl ChitchatServer {
     pub fn new(
         db: Connection,
-        project: Project,
-        project_id: i64,
+        ws: Option<Workspace>,
         vendor: Vendor,
         client: Option<ProcInfo>,
         session: SessionHint,
     ) -> Self {
         Self {
             db: Mutex::new(db),
-            project,
-            project_id,
+            ws,
             vendor,
             client,
             session,
@@ -587,13 +595,16 @@ impl ChitchatServer {
         &self,
         meta: &RequestMetaObject,
         footer: bool,
-        body: impl FnOnce(&mut Connection, &Agent) -> Result<String>,
+        body: impl FnOnce(&mut Connection, &Workspace, &Agent) -> Result<String>,
     ) -> ToolResult {
+        let Some(ws) = &self.ws else {
+            return Err(NOT_A_WORKSPACE.to_string());
+        };
         let mut conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        let result = self.me(&mut conn, meta).and_then(|me| {
-            let out = body(&mut conn, &me)?;
+        let result = self.me(&mut conn, ws, meta).and_then(|me| {
+            let out = body(&mut conn, ws, &me)?;
             let tail = if footer {
-                digest::footer(&conn, self.project_id, &me)?
+                digest::footer(&conn, ws.id, &me)?
             } else {
                 None
             };
@@ -610,7 +621,7 @@ impl ChitchatServer {
 
     /// The agent making this call. Resolved on every call rather than cached: one
     /// Codex app-server can route several sessions through the same MCP server.
-    fn me(&self, conn: &mut Connection, meta: &RequestMetaObject) -> Result<Agent> {
+    fn me(&self, conn: &mut Connection, ws: &Workspace, meta: &RequestMetaObject) -> Result<Agent> {
         // Codex puts its session id on every call (`sessionId`, equal to the hooks'
         // session_id; `threadId` differs inside subagents). Claude Code only passes
         // the id it had when it spawned us, which goes stale after /clear.
@@ -622,10 +633,10 @@ impl ChitchatServer {
             (None, Some(id)) => (Some(id.clone()), false),
             (None, None) => (None, false),
         };
-        let cwd = self.project.root.to_string_lossy().into_owned();
+        let cwd = ws.project.root.to_string_lossy().into_owned();
         agents::resolve(
             conn,
-            self.project_id,
+            ws.id,
             &Caller {
                 vendor: self.vendor,
                 client: self.client.as_ref(),
@@ -637,6 +648,9 @@ impl ChitchatServer {
     }
 
     fn refresh_docs_if_stale(&self) {
+        let Some(ws) = &self.ws else {
+            return;
+        };
         let mut last = self
             .docs_refreshed
             .lock()
@@ -646,7 +660,7 @@ impl ChitchatServer {
         }
         *last = Some(Instant::now());
         let mut conn = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = memory::refresh_docs(&mut conn, self.project_id, &self.project.root) {
+        if let Err(e) = memory::refresh_docs(&mut conn, ws.id, &ws.project.root) {
             tracing::warn!("refreshing the docs index failed: {e:#}");
         }
     }
@@ -671,12 +685,22 @@ pub fn run(client: Option<Client>) -> Result<()> {
         Some(dir) => dir.clone(),
         None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
-    let project = crate::project::detect(&cwd)?;
     let db = crate::db::open_default()?;
-    let project_id = agents::ensure_project(&db, &project)?;
-    tracing::info!(project = %project.key, ?vendor, client = ?client_proc, "starting MCP server");
+    let ws = match crate::project::detect(&cwd)? {
+        Some(project) => {
+            let id = agents::ensure_project(&db, &project)?;
+            Some(Workspace { project, id })
+        }
+        None => None,
+    };
+    tracing::info!(project = ?ws.as_ref().map(|w| &w.project.key), ?vendor, client = ?client_proc, "starting MCP server");
+    match crate::backup::auto(&db) {
+        Ok(Some(path)) => tracing::info!("daily backup written to {}", path.display()),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("daily backup failed: {e:#}"),
+    }
 
-    let server = ChitchatServer::new(db, project, project_id, vendor, client_proc, session);
+    let server = ChitchatServer::new(db, ws, vendor, client_proc, session);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

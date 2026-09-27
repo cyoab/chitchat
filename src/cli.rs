@@ -84,24 +84,44 @@ pub enum Command {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
-    /// Configure Claude Code or Codex (MCP server + hooks) to use chitchat.
-    Install {
-        #[arg(value_enum)]
-        client: Client,
-        /// Show what would change without writing anything.
+    /// Make this directory a chitchat workspace and set up Claude Code and Codex
+    /// for it (and for its git worktrees). Safe to run again.
+    Init {
+        /// Workspace directory (default: current directory).
+        path: Option<PathBuf>,
+        /// Only set up this client (repeatable). Default: every installed client.
+        #[arg(long = "client", value_enum)]
+        clients: Vec<Client>,
+        /// Workspace name (default: the directory name).
         #[arg(long)]
-        dry_run: bool,
+        name: Option<String>,
+        /// Don't import Claude Code's existing memory files as shared notes.
+        #[arg(long)]
+        no_import: bool,
         /// Skip the Stop hook that reminds agents to answer pending requests.
         #[arg(long)]
         no_stop_hook: bool,
     },
-    /// Remove chitchat's MCP server and hooks from Claude Code or Codex.
-    Uninstall {
-        #[arg(value_enum)]
-        client: Client,
-        #[arg(long)]
-        dry_run: bool,
+    /// Turn chitchat off for this workspace (keeps its chat and notes).
+    Deinit {
+        path: Option<PathBuf>,
+        #[arg(long = "client", value_enum)]
+        clients: Vec<Client>,
     },
+    /// List every chitchat workspace on this machine.
+    Workspaces,
+    /// Back up the chitchat database (default: ~/.chitchat/backups/).
+    Backup {
+        /// Write the backup here instead.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// List existing backups instead of making one.
+        #[arg(long)]
+        list: bool,
+    },
+    /// Restore the database from a backup file, or "latest". The current database
+    /// is backed up first.
+    Restore { backup: String },
     /// Show where data lives and what chitchat detects in this directory.
     Doctor,
 }

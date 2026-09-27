@@ -8,6 +8,7 @@ chitchat is a Rust CLI and stdio MCP server. It gives Claude Code and Codex sess
 - Test: `cargo test`
 - Lint (must pass): `cargo fmt --all && cargo clippy --all-targets -- -D warnings`
 - Inspect: `cargo run -- doctor` (set `CHITCHAT_HOME=/tmp/somewhere` to keep your real `~/.chitchat` untouched)
+- Release: bump `version` in Cargo.toml, then push a tag `vX.Y.Z`; `.github/workflows/release.yml` builds and publishes. `install.sh` installs from releases.
 
 ## Layout
 
@@ -17,7 +18,9 @@ chitchat is a Rust CLI and stdio MCP server. It gives Claude Code and Codex sess
 | `src/cli.rs` | clap definitions for every subcommand |
 | `src/mcp.rs` | `chitchat mcp`: the stdio MCP server and its 10 tools (rmcp) |
 | `src/hook.rs` | `chitchat hook <event>`: what Claude Code / Codex hooks run; exact per-client output |
-| `src/install.rs` | `chitchat install/uninstall`: MCP registration and hook-file merging |
+| `src/workspace.rs` | `chitchat init/deinit/workspaces`: workspace setup, legacy adoption, Claude memory import |
+| `src/clients.rs` | Per-directory client config (Claude local MCP + settings.local.json, Codex .codex/), git exclude |
+| `src/backup.rs` | `chitchat backup/restore`, daily automatic backups |
 | `src/human.rs` | Commands for the human: `post`, `tail`, `who`, `notes`, `note`, `forget`, `export` |
 | `src/agents.rs` | Participants: identity resolution (Claude by process, Codex by session), presence |
 | `src/chat.rs` | Messages, receipts (fan-out on write), inbox, acks, hook delivery |
@@ -26,7 +29,7 @@ chitchat is a Rust CLI and stdio MCP server. It gives Claude Code and Codex sess
 | `src/digest.rs` | Text shown to agents: who-lists, digests, footers |
 | `src/procs.rs` | Process ancestry (macOS `proc_pidinfo`, Linux `/proc`) |
 | `src/db.rs` | Connection setup (WAL, busy timeout, setup lock) and the migrator |
-| `src/project.rs` | Project identity from the git remote or main worktree |
+| `src/project.rs` | Workspaces: `.chitchat/workspace.json` markers, detection from subdirs and linked worktrees |
 | `src/session.rs` | Client and vendor types; session detection from the environment |
 | `src/format.rs`, `src/paths.rs` | Time/text helpers; data directory (`CHITCHAT_HOME`) |
 | `src/doctor.rs` | `chitchat doctor` |
@@ -46,5 +49,6 @@ chitchat is a Rust CLI and stdio MCP server. It gives Claude Code and Codex sess
 - **Migrations are append-only.**
   - Never edit a released file in `migrations/`. Add a new file and append it to `MIGRATIONS` in `src/db.rs`.
   - Tables are `STRICT`, and timestamps are unix milliseconds.
+- **Never touch the user's real client config in tests.** Point `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `CHITCHAT_HOME` at temp dirs, as `tests/cli.rs` does.
 - **Keep MCP tool results small** (under about 8k tokens) and paginate. Codex truncates at about 10k tokens.
 - **Keep the binary small.** Justify every new dependency and check its size impact in a release build.

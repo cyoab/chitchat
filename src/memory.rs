@@ -111,6 +111,9 @@ pub struct NoteInput {
     pub expected_revision: Option<i64>,
     /// Key of an older note this one replaces.
     pub supersedes: Option<String>,
+    /// Skip the revision check (imports, where the source file is authoritative).
+    /// Never set from agent input.
+    pub overwrite: bool,
 }
 
 #[derive(Debug)]
@@ -184,7 +187,7 @@ pub fn remember(
         }
         (Some(note), expected) => {
             let revived = note.deleted_at.is_some();
-            if !revived {
+            if !revived && !input.overwrite {
                 match expected {
                     None => bail!(
                         "note `{key}` already exists (revision {}, last updated by {} {}). Read it with \
@@ -466,7 +469,8 @@ pub fn normalize_key(key: &str) -> Result<String> {
     Ok(key)
 }
 
-fn slug(title: &str) -> String {
+/// Lowercase, dash-separated form of a title for keys.
+pub fn slug(title: &str) -> String {
     let mut out = String::new();
     for c in title.chars() {
         if c.is_ascii_alphanumeric() {

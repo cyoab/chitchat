@@ -2,6 +2,8 @@
 
 use anyhow::Result;
 
+use crate::clients;
+use crate::hook::HookEvent;
 use crate::session::{Client, SessionHint};
 
 pub fn run() -> Result<()> {
@@ -15,44 +17,62 @@ pub fn run() -> Result<()> {
     let project = crate::project::detect(&cwd)?;
     let session = SessionHint::from_env();
 
-    println!("chitchat {}", env!("CARGO_PKG_VERSION"));
+    println!("chitchat  {}", env!("CARGO_PKG_VERSION"));
+    println!("binary    {}", clients::binary_path()?.display());
     println!("database  {}", db_path.display());
     println!("sqlite    {sqlite} (journal: {journal})");
     println!(
         "schema    v{schema} (binary knows v{})",
         crate::db::SCHEMA_VERSION
     );
-    println!("project   {} [{}]", project.name, project.key);
-    println!("worktree  {}", project.root.display());
+    let backups = crate::backup::list()?;
+    match backups.first() {
+        Some(latest) => println!(
+            "backups   {} in {} (latest {})",
+            backups.len(),
+            crate::backup::dir()?.display(),
+            latest
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ),
+        None => println!("backups   none yet (`chitchat backup`)"),
+    }
     match (session.vendor, session.session_id) {
         (Some(vendor), Some(id)) => println!("session   {} {id}", vendor.as_str()),
         (Some(vendor), None) => println!("session   {} (no session id)", vendor.as_str()),
         _ => println!("session   none detected (not running inside an agent)"),
     }
+
+    let Some(project) = project else {
+        println!("workspace none here: run `chitchat init` to set one up");
+        return Ok(());
+    };
+    println!("workspace {} [{}]", project.name, project.key);
+    println!("root      {}", project.root.display());
     for client in [Client::Claude, Client::Codex] {
+        let s = clients::status(&project.root, client);
         let label = if client == Client::Claude {
             "claude"
         } else {
             "codex "
         };
-        match crate::install::status(client) {
-            Ok(s) => {
-                let mcp = if s.mcp_registered {
-                    "registered"
-                } else {
-                    "not registered"
-                };
-                let total = crate::hook::HookEvent::ALL.len();
-                println!(
-                    "{label}    MCP server {mcp} ({}); hooks {}/{total} ({})",
-                    s.mcp_config.display(),
-                    s.hooks_installed,
-                    s.hooks_file.display()
-                );
-            }
-            Err(e) => println!("{label}    could not check: {e:#}"),
-        }
+        let installed = if clients::available(client) {
+            ""
+        } else {
+            " (CLI not on PATH)"
+        };
+        println!(
+            "{label}    MCP server {}; hooks {}/{}{installed}",
+            if s.mcp {
+                "configured"
+            } else {
+                "not configured"
+            },
+            s.hooks,
+            HookEvent::ALL.len()
+        );
     }
-    println!("install   chitchat install claude | chitchat install codex");
     Ok(())
 }

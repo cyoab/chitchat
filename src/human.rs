@@ -24,7 +24,13 @@ struct Here {
 
 fn here() -> Result<Here> {
     let cwd = std::env::current_dir()?;
-    let project = crate::project::detect(&cwd)?;
+    let Some(project) = crate::project::detect(&cwd)? else {
+        bail!(
+            "{} is not in a chitchat workspace; run `chitchat init` in the project directory \
+             (`chitchat workspaces` lists existing ones)",
+            cwd.display()
+        );
+    };
     let conn = crate::db::open_default()?;
     let project_id = agents::ensure_project(&conn, &project)?;
     let me = agents::human(&conn, project_id)?;
@@ -173,4 +179,58 @@ pub fn export(dir: Option<PathBuf>) -> Result<()> {
 
 fn default_export_dir(root: &Path) -> PathBuf {
     root.join(".chitchat").join("notes")
+}
+
+pub fn backup(out: Option<&Path>, list: bool) -> Result<()> {
+    if list {
+        let backups = crate::backup::list()?;
+        if backups.is_empty() {
+            println!("No backups in {}.", crate::backup::dir()?.display());
+        }
+        for b in backups {
+            let age = b.modified.elapsed().map_or("?".to_string(), |d| {
+                crate::format::ago(crate::db::now_ms() - d.as_millis() as i64)
+            });
+            println!(
+                "{}  {}  {}{}",
+                b.path.display(),
+                crate::backup::human_size(b.size),
+                age,
+                if b.is_auto() { "  (automatic)" } else { "" }
+            );
+        }
+        return Ok(());
+    }
+    let conn = crate::db::open_default()?;
+    let path = crate::backup::create(&conn, out, "")?;
+    let size = std::fs::metadata(&path).map_or(0, |m| m.len());
+    println!(
+        "Backed up to {} ({}).",
+        path.display(),
+        crate::backup::human_size(size)
+    );
+    Ok(())
+}
+
+pub fn restore(which: &str) -> Result<()> {
+    let src = if which == "latest" {
+        crate::backup::list()?
+            .into_iter()
+            .find(|b| {
+                !b.path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("pre-restore-"))
+            })
+            .map(|b| b.path)
+            .ok_or_else(|| anyhow::anyhow!("there are no backups to restore"))?
+    } else {
+        PathBuf::from(which)
+    };
+    let saved = crate::backup::restore(&crate::paths::db_path()?, &src)?;
+    println!("Restored {}.", src.display());
+    println!(
+        "The previous database was saved to {} (restore it to undo).",
+        saved.display()
+    );
+    Ok(())
 }

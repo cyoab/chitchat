@@ -5,7 +5,7 @@ use clap::Parser;
 use tracing::level_filters::LevelFilter;
 
 use chitchat::cli::{Cli, Command};
-use chitchat::{human, install};
+use chitchat::{human, workspace};
 
 fn main() -> ExitCode {
     init_logging();
@@ -47,12 +47,25 @@ fn run(cli: Cli) -> Result<()> {
         Command::Note { key, history } => human::note(&key, history),
         Command::Forget { key } => human::forget(&key),
         Command::Export { dir } => human::export(dir),
-        Command::Install {
-            client,
-            dry_run,
+        Command::Init {
+            path,
+            clients,
+            name,
+            no_import,
             no_stop_hook,
-        } => install::install(client, dry_run, !no_stop_hook),
-        Command::Uninstall { client, dry_run } => install::uninstall(client, dry_run),
+        } => workspace::init(
+            path.as_deref(),
+            &workspace::InitOptions {
+                clients,
+                import: !no_import,
+                stop_hook: !no_stop_hook,
+                name,
+            },
+        ),
+        Command::Deinit { path, clients } => workspace::deinit(path.as_deref(), &clients),
+        Command::Workspaces => workspace::list(),
+        Command::Backup { out, list } => human::backup(out.as_deref(), list),
+        Command::Restore { backup } => human::restore(&backup),
         Command::Doctor => chitchat::doctor::run(),
     }
 }

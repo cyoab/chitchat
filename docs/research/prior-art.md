@@ -253,6 +253,9 @@ panic = "unwind"
 | 4 | Waking idle agents / Claude Channels | Not needed: the human always prompts each agent. |
 | 5 | Web UI | Deferred. `chitchat tail` covers watching the room from a terminal. |
 | 6 | Database | SQLite through `rusqlite` (bundled), with one global DB at `~/.chitchat/`. |
+| 7 | How projects are defined | By directory (2026-09-27): `chitchat init` writes `.chitchat/workspace.json`. Subdirectories and linked git worktrees join it; outside a workspace chitchat is off. Client config is per workspace and kept out of git. This replaces user-wide `chitchat install` and project keys derived from git remotes. |
+| 8 | Existing repos | `init` indexes docs, imports Claude Code's per-project memory files as notes, adopts data recorded under old keys, and configures every existing worktree. Codex memories are global (and were empty here), so they aren't imported. |
+| 9 | Backups and distribution | `VACUUM INTO` snapshots, restore through the online backup API, daily automatic backups (7 kept). Tag-triggered GitHub releases for macOS and static-musl Linux, plus a checksum-verifying `install.sh`. |
 
 ## Unverified / to test early
 

@@ -26,10 +26,21 @@ impl Env {
     /// A `chitchat` command isolated from the real `~/.chitchat` and from any agent
     /// session the tests happen to run inside.
     fn cmd(&self, client_pid: Option<u32>) -> Command {
+        let mut cmd = self.plain_cmd(&self.repo, client_pid);
+        cmd.env("CHITCHAT_PROJECT", "example.com/team/demo");
+        cmd
+    }
+
+    /// Without a CHITCHAT_PROJECT override: projects come from workspace markers.
+    /// Client config dirs point into the temp home, so Claude Code memory files
+    /// can be staged there and nothing real is read.
+    fn plain_cmd(&self, dir: &Path, client_pid: Option<u32>) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_chitchat"));
-        cmd.current_dir(&self.repo)
+        cmd.current_dir(dir)
             .env("CHITCHAT_HOME", self.home.path().join("data"))
-            .env("CHITCHAT_PROJECT", "example.com/team/demo")
+            .env("CLAUDE_CONFIG_DIR", self.home.path().join("claude-config"))
+            .env("CODEX_HOME", self.home.path().join("codex-home"))
+            .env_remove("CHITCHAT_PROJECT")
             .env_remove("CHITCHAT_CLIENT_PID")
             .env_remove("CLAUDECODE")
             .env_remove("CLAUDE_PID")
@@ -110,8 +121,11 @@ struct Mcp {
 
 impl Mcp {
     fn start(env: &Env, client: &str, client_pid: u32, session: Option<&str>) -> Self {
-        let mut child = env
-            .cmd(Some(client_pid))
+        Mcp::spawn(env.cmd(Some(client_pid)), client, session)
+    }
+
+    fn spawn(mut cmd: Command, client: &str, session: Option<&str>) -> Self {
+        let mut child = cmd
             .args(["mcp", "--client", client])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -182,6 +196,20 @@ impl Mcp {
             .to_string();
         assert_ne!(result["isError"], true, "{tool} failed: {text}");
         text
+    }
+
+    /// Like `call`, but returns (text, is_error) instead of panicking on errors.
+    fn try_call(&mut self, tool: &str, args: Value) -> (String, bool) {
+        let mut params = json!({ "name": tool, "arguments": args });
+        if let Some(session) = &self.session {
+            params["_meta"] = json!({ "sessionId": session, "threadId": session });
+        }
+        let result = self.request("tools/call", params);
+        let text = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        (text, result["isError"] == true)
     }
 }
 
@@ -399,4 +427,185 @@ fn doctor_reports_schema_and_project() {
     assert!(text.contains("journal: wal"), "{text}");
     assert!(text.contains("schema    v1"), "{text}");
     assert!(text.contains("demo [example.com/team/demo]"), "{text}");
+}
+
+fn run_ok(mut cmd: Command) -> String {
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{cmd:?}: {out:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn init_sets_up_an_existing_repo_with_worktrees_and_claude_memory() {
+    let env = Env::new();
+    let repo = env.repo.canonicalize().unwrap();
+    std::fs::write(
+        repo.join("README.md"),
+        "# Demo\n\nThe widget cache lives in var/cache.\n",
+    )
+    .unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    let wt = repo.parent().unwrap().join("repo-wt");
+    git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+
+    // Claude Code already kept a memory for this repo.
+    let encoded: String = repo
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let memory = env
+        .home
+        .path()
+        .join("claude-config/projects")
+        .join(encoded)
+        .join("memory");
+    std::fs::create_dir_all(&memory).unwrap();
+    std::fs::write(
+        memory.join("deploy-freeze.md"),
+        "---\nname: deploy-freeze\ndescription: No deploys on Fridays\nmetadata:\n  type: project\n---\n\nThe team freezes deploys every Friday.\n",
+    )
+    .unwrap();
+    std::fs::write(memory.join("MEMORY.md"), "- index, not a note\n").unwrap();
+    // The user already has their own (untracked) Codex settings here.
+    std::fs::create_dir_all(repo.join(".codex")).unwrap();
+    std::fs::write(repo.join(".codex/config.toml"), "model = \"gpt-6\"\n").unwrap();
+
+    let init = || {
+        let mut cmd = env.plain_cmd(&repo, None);
+        cmd.args(["init", "--client", "codex"]);
+        run_ok(cmd)
+    };
+    let first = init();
+    assert!(
+        first.contains("Initialized chitchat workspace \"repo\""),
+        "{first}"
+    );
+    assert!(
+        first.contains("Imported Claude Code memory: 1 new"),
+        "{first}"
+    );
+    assert!(first.contains("Docs: 1 Markdown files indexed"), "{first}");
+    assert!(repo.join(".chitchat/workspace.json").exists());
+    for dir in [&repo, &wt] {
+        let hooks = std::fs::read_to_string(dir.join(".codex/hooks.json")).unwrap();
+        assert_eq!(hooks.matches("--client codex").count(), 4, "{hooks}");
+        let config = std::fs::read_to_string(dir.join(".codex/config.toml")).unwrap();
+        assert!(config.contains("[mcp_servers.chitchat]"), "{config}");
+    }
+    let merged = std::fs::read_to_string(repo.join(".codex/config.toml")).unwrap();
+    assert!(
+        merged.starts_with("model = \"gpt-6\"\n\n# >>> chitchat"),
+        "{merged}"
+    );
+    // None of it shows up in git.
+    assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+    assert_eq!(git(&wt, &["status", "--porcelain"]), "");
+
+    // Running it again changes nothing.
+    let again = init();
+    assert!(again.contains("Refreshing"), "{again}");
+    assert!(again.contains("0 new, 0 updated, 1 unchanged"), "{again}");
+    assert!(again.contains("already set up"), "{again}");
+
+    // Subdirectories and the linked worktree are the same workspace.
+    std::fs::create_dir_all(repo.join("src/deep")).unwrap();
+    let mut notes = env.plain_cmd(&repo.join("src/deep"), None);
+    notes.args(["notes"]);
+    let listed = run_ok(notes);
+    assert!(listed.contains("imported/claude/deploy-freeze"), "{listed}");
+    let mut found = env.plain_cmd(&wt, None);
+    found.args(["notes", "widget", "cache"]);
+    let found = run_ok(found);
+    assert!(
+        found.contains("README.md") && found.contains("Demo"),
+        "{found}"
+    );
+    let mut list = env.plain_cmd(&repo, None);
+    list.arg("workspaces");
+    assert!(run_ok(list).contains(repo.to_str().unwrap()));
+
+    // deinit removes the client config but keeps the data.
+    let mut off = env.plain_cmd(&repo, None);
+    off.args(["deinit", "--client", "codex"]);
+    let off = run_ok(off);
+    assert!(off.contains("chitchat is off"), "{off}");
+    for dir in [&repo, &wt] {
+        assert!(!dir.join(".codex/hooks.json").exists());
+    }
+    assert!(!wt.join(".codex/config.toml").exists());
+    // The user's own Codex settings survive, and nothing is left behind in the repo.
+    let user_config = std::fs::read_to_string(repo.join(".codex/config.toml")).unwrap();
+    assert_eq!(user_config, "model = \"gpt-6\"\n");
+    assert!(!repo.join(".codex/config.toml.bak").exists());
+    assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+    let mut still = env.plain_cmd(&repo, None);
+    still.arg("notes");
+    assert!(run_ok(still).contains("imported/claude/deploy-freeze"));
+}
+
+#[test]
+fn outside_a_workspace_chitchat_stays_out_of_the_way() {
+    let env = Env::new();
+    let client = FakeClient::start();
+    let outside = env.home.path().join("elsewhere");
+    std::fs::create_dir_all(&outside).unwrap();
+
+    let mut hook = env.plain_cmd(&outside, Some(client.pid()));
+    hook.args(["hook", "user-prompt-submit", "--client", "claude"]);
+    let out = run_with_stdin(
+        hook,
+        &json!({ "cwd": outside, "session_id": "s" }).to_string(),
+    );
+    assert!(out.status.success() && out.stdout.is_empty(), "{out:?}");
+
+    let mut mcp = Mcp::spawn(env.plain_cmd(&outside, Some(client.pid())), "claude", None);
+    let (text, is_error) = mcp.try_call("who", json!({}));
+    assert!(is_error && text.contains("chitchat init"), "{text}");
+
+    let out = env.plain_cmd(&outside, None).arg("who").output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("chitchat init"));
+}
+
+#[test]
+fn backups_restore_earlier_state() {
+    let env = Env::new();
+    env.cli(&["post", "first"]);
+    let made = env.cli(&["backup"]);
+    assert!(made.starts_with("Backed up to "), "{made}");
+    env.cli(&["post", "second"]);
+    assert!(env.cli(&["backup", "--list"]).contains("chitchat-"));
+
+    let restored = env.cli(&["restore", "latest"]);
+    assert!(
+        restored.contains("previous database was saved"),
+        "{restored}"
+    );
+    let tail = env.cli(&["tail", "--no-follow"]);
+    assert!(tail.contains("first") && !tail.contains("second"), "{tail}");
+
+    // The pre-restore copy has the newer state, so the restore can be undone.
+    let pre = std::fs::read_dir(env.home.path().join("data/backups"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.to_string_lossy().contains("pre-restore-"))
+        .unwrap();
+    env.cli(&["restore", pre.to_str().unwrap()]);
+    assert!(env.cli(&["tail", "--no-follow"]).contains("second"));
 }
