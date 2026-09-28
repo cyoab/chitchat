@@ -230,8 +230,11 @@ pub struct Status {
 }
 
 impl Status {
+    /// Whether chitchat is set up for this harness here. The skill doesn't count:
+    /// most harnesses share `.agents/skills`, so its presence says nothing about
+    /// which of them were set up.
     pub fn configured(&self) -> bool {
-        self.mcp || self.hooks > 0 || self.skill == Some(true)
+        self.mcp || self.hooks > 0
     }
 }
 
@@ -897,6 +900,16 @@ mod tests {
         let fresh = with_json_server(json!({}), &["context_servers"], plain);
         assert_eq!(without_json_server(fresh, &["context_servers"]), json!({}));
         let _ = &AMP;
+    }
+
+    #[test]
+    fn a_shared_skill_alone_does_not_mean_a_harness_is_set_up() {
+        use crate::harness::ZED;
+        let dir = tempfile::tempdir().unwrap();
+        install_skill(&dir.path().join(".agents/skills/chitchat/SKILL.md")).unwrap();
+        let s = status(dir.path(), &ZED);
+        assert_eq!(s.skill, Some(true));
+        assert!(!s.configured());
     }
 
     #[test]
